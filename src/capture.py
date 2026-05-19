@@ -13,7 +13,7 @@ except ImportError:
     )
 
 
-def capture_iq_data(num_samples=128):
+def capture_iq_data(num_samples=1024):
     """
     Intenta capturar datos del hardware (RTL-SDR / HackRF).
     Si falla, cae en modo Mock/Simulación generando señales sintéticas.
