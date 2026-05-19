@@ -4,6 +4,7 @@ import time
 from capture import capture_iq_data
 from processing import normalize_iq, spectrogram_stft
 from model import load_pretrained_model, build_amc_cnn, save_model
+from prediction import get_prediction
 from plot_signal import visualize_iq
 
 
@@ -29,45 +30,14 @@ def execute_processing(raw_iq, logger):
     """Maneja la normalización y transformaciones de los tensores"""
     logger.info(">> Fase 2: Preprocesamiento")
     iq_tensor = normalize_iq(raw_iq)
-    logger.info(f"Tensor 1D I/Q normalizado con shape: {iq_tensor.shape}")
 
     stft_tensor = spectrogram_stft(raw_iq)
-    logger.info(f"Tensor 2D Espectrograma generado con shape: {stft_tensor.shape}")
-    return iq_tensor
+    return iq_tensor, stft_tensor
 
 
-def execute_prediction(iq_tensor, logger):
-    """Maneja el ruteo del modelo, pesos y clasificación de hardware"""
-    logger.info(">> Fase 3: Predicción con CNN")
-    model = load_pretrained_model("amc_model.h5")
-
-    if model is None:
-        logger.warning("No se halló modelo preentrenado. Inicializando y guardando...")
-        model = build_amc_cnn(input_shape=(128, 2), num_classes=11)
-        save_model(model, "amc_model.h5")
-
-    # Extraemos una ventana de observación estructurada (Frame) de 128 muestras
-    # para emparejar con el input_shape original de la red neuronal.
-    window_size = 128
-    if len(iq_tensor) >= window_size:
-        iq_frame = iq_tensor[:window_size, :]
-    else:
-        # Padding en caso anómalo de buffers demasiado cortos
-        iq_frame = np.pad(iq_tensor, ((0, window_size - len(iq_tensor)), (0, 0)))
-
-    # Pasamos 'iq_frame' al modelo en lugar del tensor completo
-    # [Batch, Tiempo, Canales] -> quedará como (1, 128, 2)
-    hq_batch = np.expand_dims(iq_frame, axis=0)
-    preds = model.predict(hq_batch, verbose=0)
-
-    predicted_class_idx = np.argmax(preds[0])
-    confidence = preds[0][predicted_class_idx]
-
-    logger.info("=== RESULTADO DE CLASIFICACIÓN ===")
-    logger.info(
-        f"Clase predicha (índice): {predicted_class_idx}, Nivel de confianza: {confidence:.2%}"
-    )
-    logger.info("----------------------------------")
+def execute_prediction(iq_tensor, stft_tensor, logger):
+    """Maneja la lógica de predicción usando el modelo CNN híbrido"""
+    get_prediction(iq_tensor, stft_tensor, logger)
 
 
 def execute_visualization(raw_iq, logger):
@@ -88,8 +58,19 @@ def main():
     try:
         # Pipeline Lineal y Limpio
         raw_iq = execute_capture(logger)
-        iq_tensor = execute_processing(raw_iq, logger)
-        execute_prediction(iq_tensor, logger)
+
+        # Procesamos la señal para obtener ambos tensores: el temporal (1D) y el espectrograma (2D)
+        iq_tensor, stft_tensor = execute_processing(raw_iq, logger)
+
+        logger.info(
+            "Tensores preparados para la predicción. Shape IQ: "
+            f"{iq_tensor.shape}, Shape STFT: {stft_tensor.shape}"
+        )
+
+        # Pasamos ambos tensores al modelo --> TO DO
+        # execute_prediction(iq_tensor, stft_tensor, logger)
+
+        # Visualización final (opcional, pero útil para debugging y validación visual)
         execute_visualization(raw_iq, logger)
 
     except Exception as e:
