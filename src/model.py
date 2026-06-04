@@ -34,7 +34,9 @@ def save_model(model, model_name="amc_model.h5"):
     logging.info(f"Modelo guardado exitosamente en: {model_path}")
 
 
-def build_amc_cnn(input_shape_1d=(128, 2), input_shape_2d=(32, 8193, 1), num_classes=11, l2_reg=1e-4):
+def build_amc_cnn(
+    input_shape_1d=(128, 2), input_shape_2d=(32, 8193, 1), num_classes=11, l2_reg=1e-4
+):
     """
     Construye una Red Neuronal Convolucional (CNN) Híbrida (Multi-Input) orientada a la
     clasificación de señales base I/Q.
@@ -52,34 +54,54 @@ def build_amc_cnn(input_shape_1d=(128, 2), input_shape_2d=(32, 8193, 1), num_cla
     # RAMA 1: Procesamiento Temporal 1D (Señal cruda IQ)
     # =========================================================================
     input_1d = layers.Input(shape=input_shape_1d, name="iq_1d_input")
-    
-    x1 = layers.Conv1D(64, kernel_size=3, padding="same", activation="relu", 
-                       kernel_regularizer=regularizers.l2(l2_reg))(input_1d)
+
+    x1 = layers.Conv1D(
+        64,
+        kernel_size=3,
+        padding="same",
+        activation="relu",
+        kernel_regularizer=regularizers.l2(l2_reg),
+    )(input_1d)
     x1 = layers.BatchNormalization()(x1)
     x1 = layers.MaxPooling1D(pool_size=2)(x1)
 
-    x1 = layers.Conv1D(128, kernel_size=3, padding="same", activation="relu", 
-                       kernel_regularizer=regularizers.l2(l2_reg))(x1)
+    x1 = layers.Conv1D(
+        128,
+        kernel_size=3,
+        padding="same",
+        activation="relu",
+        kernel_regularizer=regularizers.l2(l2_reg),
+    )(x1)
     x1 = layers.BatchNormalization()(x1)
     x1 = layers.MaxPooling1D(pool_size=2)(x1)
-    
+
     flat_1d = layers.Flatten()(x1)
 
     # =========================================================================
     # RAMA 2: Procesamiento Frecuencial 2D (Espectrograma STFT)
     # =========================================================================
     input_2d = layers.Input(shape=input_shape_2d, name="stft_2d_input")
-    
-    x2 = layers.Conv2D(32, kernel_size=(3, 3), padding="same", activation="relu", 
-                       kernel_regularizer=regularizers.l2(l2_reg))(input_2d)
+
+    x2 = layers.Conv2D(
+        32,
+        kernel_size=(3, 3),
+        padding="same",
+        activation="relu",
+        kernel_regularizer=regularizers.l2(l2_reg),
+    )(input_2d)
     x2 = layers.BatchNormalization()(x2)
     x2 = layers.MaxPooling2D(pool_size=(2, 2))(x2)
 
-    x2 = layers.Conv2D(64, kernel_size=(3, 3), padding="same", activation="relu", 
-                       kernel_regularizer=regularizers.l2(l2_reg))(x2)
+    x2 = layers.Conv2D(
+        64,
+        kernel_size=(3, 3),
+        padding="same",
+        activation="relu",
+        kernel_regularizer=regularizers.l2(l2_reg),
+    )(x2)
     x2 = layers.BatchNormalization()(x2)
     x2 = layers.MaxPooling2D(pool_size=(2, 2))(x2)
-    
+
     flat_2d = layers.Flatten()(x2)
 
     # =========================================================================
@@ -87,9 +109,11 @@ def build_amc_cnn(input_shape_1d=(128, 2), input_shape_2d=(32, 8193, 1), num_cla
     # =========================================================================
     merged = layers.concatenate([flat_1d, flat_2d])
 
-    z = layers.Dense(256, activation="relu", kernel_regularizer=regularizers.l2(l2_reg))(merged)
+    z = layers.Dense(
+        256, activation="relu", kernel_regularizer=regularizers.l2(l2_reg)
+    )(merged)
     z = layers.Dropout(0.5)(z)
-    
+
     z = layers.Dense(128, activation="relu")(z)
     z = layers.Dropout(0.3)(z)
 
@@ -97,7 +121,9 @@ def build_amc_cnn(input_shape_1d=(128, 2), input_shape_2d=(32, 8193, 1), num_cla
     output = layers.Dense(num_classes, activation="softmax", name="mod_prediction")(z)
 
     # Construir el modelo multi-input
-    model = models.Model(inputs=[input_1d, input_2d], outputs=output, name="DeepSignal_Hybrid_AMC")
+    model = models.Model(
+        inputs=[input_1d, input_2d], outputs=output, name="DeepSignal_Hybrid_AMC"
+    )
 
     # Compilar el modelo
     model.compile(
@@ -117,9 +143,7 @@ if __name__ == "__main__":
 
     # Ej: Asumiendo trama de 128 muestras y espectrograma de (32, 8193, 1)
     amc_model = build_amc_cnn(
-        input_shape_1d=(128, 2), 
-        input_shape_2d=(32, 8193, 1), 
-        num_classes=11
+        input_shape_1d=(128, 2), input_shape_2d=(32, 8193, 1), num_classes=11
     )
 
     amc_model.summary()

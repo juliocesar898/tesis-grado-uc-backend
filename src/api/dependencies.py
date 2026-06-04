@@ -5,6 +5,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+
 class ModelDependency:
     def __init__(self):
         self.model: Optional[tf.keras.Model] = None
@@ -19,28 +20,38 @@ class ModelDependency:
             try:
                 self.classes = np.load(classes_path, allow_pickle=True)
             except Exception as e:
-                logger.warning(f"No se encontró mapping de clases válido en: {classes_path}. Usaremos genéricos.")
+                logger.warning(
+                    f"No se encontró mapping de clases válido en: {classes_path}. Usaremos genéricos."
+                )
                 self.classes = np.array([f"Mod_Class_{i}" for i in range(11)])
-                
-            logger.info("Dependencias RFML (Modelo y Clases) cargadas exitosamente en memoria RAM.")
+
+            logger.info(
+                "Dependencias RFML (Modelo y Clases) cargadas exitosamente en memoria RAM."
+            )
         except Exception as e:
             logger.error(f"Error cargando dependencias de inferencia H5: {e}")
             raise
 
-    def predict(self, iq_batch: np.ndarray, stft_batch: np.ndarray) -> Tuple[str, float]:
-        """Procesa paso feed-forward de forma Thread-Safe"""
+    def predict(self, iq_batch: np.ndarray) -> Tuple[str, float]:
+        """Procesa paso feed-forward de forma Thread-Safe para una sola entrada I/Q"""
         if self.model is None or self.classes is None:
             raise RuntimeError("API invocada sin cargar el backend clasificador.")
-        
-        preds = self.model.predict([iq_batch, stft_batch], verbose=0)
+
+        # Asegurar que el batch tenga la dimensión correcta (1, 128, 2)
+        if len(iq_batch.shape) == 2:
+            iq_batch = np.expand_dims(iq_batch, axis=0)
+
+        preds = self.model.predict(iq_batch, verbose=0)
         idx = int(np.argmax(preds[0]))
         confidence = float(preds[0][idx])
         modulation_class = str(self.classes[idx])
-        
+
         return modulation_class, confidence
+
 
 # Singleton instanciado listo para inyectarse como global dependencie usando Depends()
 model_dep = ModelDependency()
+
 
 def get_model() -> ModelDependency:
     return model_dep
