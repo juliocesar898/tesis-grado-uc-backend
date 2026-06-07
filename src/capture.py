@@ -113,7 +113,7 @@ class SDRWorker:
 
                     # 🚀 ¡IMPRESIÓN EN CONSOLA! Monitoreo directo en tu terminal de Uvicorn
                     print(
-                        f"[IA CONSOLA] Señal Generada: {mod_actual:7} | Predicción Red: {mod_class:7} (Confianza: {confidence*100:.2f}%)"
+                        f"[IA CONSOLA] Rafaga Señal Generada: {mod_actual:7}"
                     )
 
                 # Transmitir por WebSockets a Postman / Frontend si hay clientes conectados
