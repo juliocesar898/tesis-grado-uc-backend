@@ -35,7 +35,7 @@ def save_model(model, model_name="amc_model.h5"):
 
 
 def build_amc_cnn(
-    input_shape_1d=(128, 2), input_shape_2d=(32, 8193, 1), num_classes=11, l2_reg=1e-4
+    input_shape_1d=(128, 2), input_shape_2d=(32, 9, 1), num_classes=11, l2_reg=1e-4
 ):
     """
     Construye una Red Neuronal Convolucional (CNN) Híbrida (Multi-Input) orientada a la
@@ -141,9 +141,9 @@ if __name__ == "__main__":
     # Prueba de Humo y Arquitectura Base
     print("Inicializando Arquitectura Híbrida DeepSignal AMC...")
 
-    # Ej: Asumiendo trama de 128 muestras y espectrograma de (32, 8193, 1)
+    # Ej: Asumiendo trama de 128 muestras y espectrograma de (17, 9, 1)
     amc_model = build_amc_cnn(
-        input_shape_1d=(128, 2), input_shape_2d=(32, 8193, 1), num_classes=11
+        input_shape_1d=(128, 2), input_shape_2d=(17, 9, 1), num_classes=11
     )
 
     amc_model.summary()

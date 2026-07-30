@@ -30,6 +30,6 @@ def cargar_radio_ml(path_archivo):
 
     print("Dataset cargado con éxito.")
     print(f"Forma de X (Muestras I/Q): {X.shape}")
-    print(f"Total de clases encontradas: {len(np.unique(Y_mod))}")
+    print(f"Total de clases encontradas: {len(np.unique(y_mod))}")
 
     return X, y_mod, y_snr

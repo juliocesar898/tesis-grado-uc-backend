@@ -31,22 +31,48 @@ def normalize_iq(iq_data):
 def spectrogram_stft(iq_data, fs=1.0):
     """
     Transforma los datos IQ en espectrogramas usando STFT.
-    Apropiado para arquitecturas CNN 2D.
+    Apropiado para arquitecturas CNN 2D. Garantiza salida de shape (17, 9, 1).
     """
-    logging.info("Generando espectrograma usando STFT.")
-    iq_data = np.asarray(iq_data, dtype=complex)
+    logging.info("Generando espectrograma usando STFT configurado para AMC.")
+    iq_data = np.asarray(iq_data)
 
-    f, t, Zxx = signal.stft(iq_data, fs=fs, nperseg=32)
+    # 1. Combinar componentes I/Q si se recibe un tensor temporal (128, 2)
+    if iq_data.ndim == 2 and iq_data.shape[1] == 2:
+        iq_complex = iq_data[:, 0] + 1j * iq_data[:, 1]
+    else:
+        iq_complex = iq_data.astype(complex)
+
+    # 2. Configurar scipy.signal.stft para obtener dimensiones (17, 9) con ráfagas de 128 muestras
+    f, t, Zxx = signal.stft(
+        iq_complex,
+        fs=fs,
+        nperseg=32,
+        noverlap=16,
+        nfft=32,
+        boundary="even",
+        padded=True
+    )
     espectrograma = np.abs(Zxx)
+
+    # 3. Aplicar normalización Min-Max [0, 1]
+    spec_min = np.min(espectrograma)
+    spec_max = np.max(espectrograma)
+    if spec_max > spec_min:
+        espectrograma = (espectrograma - spec_min) / (spec_max - spec_min)
+    else:
+        espectrograma = np.zeros_like(espectrograma)
+
+    # 4. Expandir dimensiones agregando el canal al final -> (17, 9, 1)
     espectrograma_tensor = np.expand_dims(espectrograma, axis=-1)
 
-    # Validación de dimensiones: [Frecuencias, Tiempos, Canal (1)]
-    if len(espectrograma_tensor.shape) != 3 or espectrograma_tensor.shape[-1] != 1:
+    # Validación estricta de dimensiones
+    expected_shape = (32, 9, 1)
+    if espectrograma_tensor.shape != expected_shape:
         logging.error(
-            f"Error de dimensiones en spectrogram_stft. Actual: {espectrograma_tensor.shape}"
+            f"Error de dimensiones en spectrogram_stft. Actual: {espectrograma_tensor.shape}, Esperado: {expected_shape}"
         )
         raise ValueError(
-            "El espectrograma debe tener formato tridimensional [Frecuencia, Tiempo, Canales]."
+            f"El espectrograma resultante de la STFT {espectrograma_tensor.shape} no coincide con el esperado {expected_shape}."
         )
 
     return espectrograma_tensor
