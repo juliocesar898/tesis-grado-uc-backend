@@ -2,12 +2,17 @@ import numpy as np
 import logging
 import asyncio
 import time
-import threading  # <-- Esencial para que no se congele la API al escanear
+import threading
+import random
+import pickle
+
 from src.api.websocket_manager import stream_manager
 from src.api.dependencies import model_dep
+from src.processing import normalize_iq  # <-- IMPORTACIÓN CORREGIDA
 
 class SDRWorker:
     def __init__(self):
+        # Variables de control de la API y el Hilo (Thread)
         self.is_running = False
         self.thread = None
         self.config = {
@@ -15,6 +20,11 @@ class SDRWorker:
             "process_psd": True,
             "run_amc_inference": True,
         }
+        
+        # Variables para cargar el dataset RadioML
+        self.dataset_path = "dataset/RML2016.10a_dict.pkl"
+        self.radio_ml_data = None
+        self.radio_ml_keys = None
 
     def actualizar_configuracion(self, nueva_config: dict):
         """Actualiza las banderas de procesamiento bajo demanda desde HTTP"""
@@ -27,105 +37,79 @@ class SDRWorker:
             self.is_running = True
             self.thread = threading.Thread(target=self._loop_procesamiento, daemon=True)
             self.thread.start()
-            logging.info("[SDR WORKER] Hilo de telemetría RF encendido exitosamente.")
+            logging.info("[SDR WORKER] Hilo de telemetría encendido (Modo Dataset Real).")
 
     def detener(self):
         """Apaga el flujo continuo de forma segura"""
         self.is_running = False
-        if self.thread:
-            self.thread.join(timeout=2)
-            logging.info("[SDR WORKER] Hilo de telemetría RF destruido limpiamente.")
+        if self.thread is not None:
+            self.thread.join(timeout=2.0)
+            logging.info("[SDR WORKER] Hilo de telemetría detenido.")
+
+    def load_dataset_for_simulation(self):
+        """Carga el dataset en memoria solo la primera vez que se inicia el loop"""
+        if self.radio_ml_data is None:
+            logging.info(f"[SDR WORKER] Cargando {self.dataset_path} en RAM...")
+            try:
+                with open(self.dataset_path, 'rb') as f:
+                    self.radio_ml_data = pickle.load(f, encoding='latin1')
+                    
+                    # FILTRO SNR > 0: Guardamos solo las llaves que tienen SNR positivo
+                    self.radio_ml_keys = [k for k in self.radio_ml_data.keys() if k[1] > 0]
+                    
+                logging.info(f"[SDR WORKER] ¡Dataset cargado con éxito! Usando solo señales con SNR > 0.")
+            except Exception as e:
+                logging.error(f"[SDR WORKER ERROR] No se pudo cargar el dataset: {e}")
+
 
     def _loop_procesamiento(self):
-        """Bucle continuo que genera señales sintéticas con modulaciones aleatorias"""
-        logging.info(
-            "[SDR WORKER] Loop encendido. Generando ráfagas RF sintéticas variables..."
-        )
+        """El bucle real que corre en el hilo secundario generando ráfagas"""
+        self.load_dataset_for_simulation()
 
-        # Lista de tipos de modulación que vamos a simular matemáticamente
-        tipos_modulacion = ["BPSK", "QPSK", "8PSK", "QAM16"]
-        rng = np.random.default_rng()
+        # Variables para mantener la señal unos segundos
+        current_key = None
+        last_change_time = 0
+        segundos_por_modulacion = 6.0  # Tiempo que durará cada señal antes de cambiar
 
         while self.is_running:
             try:
-                # 1. Seleccionar aleatoriamente un esquema de modulación para esta ráfaga
-                mod_actual = rng.choice(tipos_modulacion)
-
-                # Generamos un flujo de bits aleatorios (símbolos)
-                num_símbolos = 128
-
-                if mod_actual == "BPSK":
-                    # 2 fases: 0 y pi
-                    fases = rng.choice([0, np.pi], size=num_símbolos)
-                    i_vals = np.cos(fases)
-                    q_vals = np.sin(fases)
-
-                elif mod_actual == "QPSK":
-                    # 4 fases ordenadas en los cuadrantes
-                    fases = rng.choice([np.pi/4, 3*np.pi/4, -3*np.pi/4, -np.pi/4], size=num_símbolos)
-                    i_vals = np.cos(fases)
-                    q_vals = np.sin(fases)
-
-                elif mod_actual == "8PSK":
-                    # 8 fases distribuidas simétricamente en el círculo unitario
-                    fases = rng.choice([k * np.pi / 4 for k in range(8)], size=num_símbolos)
-                    i_vals = np.cos(fases)
-                    q_vals = np.sin(fases)
-
-                elif mod_actual == "QAM16":
-                    # Amplitudes en rejilla cuadrática de 4x4 (-3, -1, 1, 3)
-                    i_vals = rng.choice([-3, -1, 1, 3], size=num_símbolos) / 3.0
-                    q_vals = rng.choice([-3, -1, 1, 3], size=num_símbolos) / 3.0
-
-                # 2. Añadir Ruido Blanco Gaussiano (AWGN) para simular el aire real
-                snr_lineal = 10 ** (15 / 10)  # Simula una SNR saludable de 15 dB
-                potencia_ruido = 1.0 / (2.0 * snr_lineal)
-
-                i_vals += rng.normal(0, np.sqrt(potencia_ruido), num_símbolos)
-                q_vals += rng.normal(0, np.sqrt(potencia_ruido), num_símbolos)
-
-                # Empaquetamos en la matriz shape (128, 2) que espera estrictamente tu CNN
-                ventana_iq = np.stack((i_vals, q_vals), axis=-1)
-
-                payload = {}
-
-                # Filtro Constelación
-                if self.config["process_constellation"]:
-                    payload["constellation"] = {
-                        "i": ventana_iq[:, 0].tolist(),
-                        "q": ventana_iq[:, 1].tolist()
-                    }
-
-                # Filtro Espectro (Densidad de Potencia Espectral via FFT)
-                if self.config["process_psd"]:
-                    complex_signal = ventana_iq[:, 0] + 1j * ventana_iq[:, 1]
-                    fft_vals = np.abs(np.fft.fftshift(np.fft.fft(complex_signal)))
-                    psd_db = (20 * np.log10(fft_vals + 1e-6)).tolist()
-                    payload["psd"] = psd_db
-
-                # Filtro Inferencia AMC (Predicción de la IA en tiempo real)
-                if self.config["run_amc_inference"] and model_dep.model is not None:
-                    mod_class, confidence = model_dep.predict(ventana_iq)
-                    payload["classification"] = {
-                        "modulation": mod_class,
-                        "probability": confidence,
-                    }
-
-                    # 🚀 ¡IMPRESIÓN EN CONSOLA! Monitoreo directo en tu terminal de Uvicorn
-                    print(
-                        f"[IA CONSOLA] Rafaga Señal Generada: {mod_actual:7}"
-                    )
-
-                # Transmitir por WebSockets a Postman / Frontend si hay clientes conectados
-                if payload and stream_manager.active_connections:
-                    asyncio.run(stream_manager.broadcast(payload))
-
-                # Pausa de 1 segundo entre ráfagas para legibilidad de logs
-                time.sleep(1.0)
-
+                # Verificar que el dataset esté cargado
+                if self.radio_ml_data and self.radio_ml_keys:
+                    
+                    # 1. Cambiar la Modulación y SNR solo si ya pasó el tiempo establecido
+                    tiempo_actual = time.time()
+                    if current_key is None or (tiempo_actual - last_change_time) > segundos_por_modulacion:
+                        current_key = random.choice(self.radio_ml_keys)
+                        last_change_time = tiempo_actual
+                        logging.info("-" * 50)
+                        logging.info(f"[SDR WORKER] Cambiando sintonía a nueva señal...")
+                    
+                    # Limpiar el string
+                    mod_name_generada = current_key[0].decode('utf-8') if isinstance(current_key[0], bytes) else current_key[0]
+                    snr_generado = current_key[1]
+                    
+                    # 2. Extraer una ráfaga aleatoria DENTRO de la modulación actual
+                    muestras = self.radio_ml_data[current_key]
+                    idx = random.randint(0, len(muestras) - 1)
+                    iq_sample = muestras[idx]  # Forma: (2, 128)
+                    
+                    # 3. Convertir a Array Complejo (I + jQ)
+                    ventana_iq = iq_sample[0] + 1j * iq_sample[1]
+                    
+                    # 4. Inferencia con la IA (Solo si está activa en la config)
+                    if self.config.get("run_amc_inference"):
+                        predicted_class, confidence = model_dep.predict(ventana_iq)
+                        
+                        # Formatear bonito para la consola
+                        logging.info(f"[IA CONSOLA] Real: {mod_name_generada:8} (SNR: {snr_generado:3}dB) | Predicho: {predicted_class:8} ({confidence*100:6.2f}%)")
+                        
+                    # (Más adelante aquí enviaremos los datos al WebSocket)
+                    
             except Exception as e:
-                logging.error(f"[SDR WORKER ERROR] Fallo en loop dinámico: {e}")
-                time.sleep(1)
+                logging.error(f"[SDR WORKER ERROR] Fallo en loop de captura: {e}")
+            
+            # 5. Esperar 1.5 segundos entre cada escaneo de la misma señal
+            time.sleep(1.5)
 
-# Instanciación del Singleton único para todo el Backend
+# Instancia global para ser importada en el router
 sdr_worker = SDRWorker()
