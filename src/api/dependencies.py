@@ -36,45 +36,41 @@ class ModelDependency:
 
     def predict(self, ventana_iq: np.ndarray):
         """
-        Recibe una ráfaga IQ (compleja o 128x2), genera los tensores 1D y 2D
-        y ejecuta la inferencia en la red híbrida.
+        Recibe una ráfaga IQ, genera los tensores 1D y 2D compatibles con 1024 muestras
+        y ejecuta la inferencia en la red híbrida de 24 clases.
         """
         if self.model is None:
-            raise ValueError("El modelo no ha sido cargado en memoria.")
+            raise ValueError("El modelo híbrido no ha sido cargado en memoria.")
 
-        # 1. Preparar entrada 1D -> (128, 2) SIN DISTORSIONAR LA AMPLITUD
+        # 1. Preparar entrada 1D -> (1024, 2)
         if np.iscomplexobj(ventana_iq):
-            # Solo extraemos los componentes real e imaginario sin re-escalar
             iq_1d = np.column_stack((np.real(ventana_iq), np.imag(ventana_iq)))
         else:
             iq_1d = ventana_iq
 
-        if len(iq_1d) > 128:
-            iq_1d = iq_1d[:128]
-        elif len(iq_1d) < 128:
-            iq_1d = np.pad(iq_1d, ((0, 128 - len(iq_1d)), (0, 0)))
+        # Escalabilidad de ventana a 1024 muestras
+        window_size = 1024
+        if len(iq_1d) > window_size:
+            iq_1d = iq_1d[:window_size]
+        elif len(iq_1d) < window_size:
+            iq_1d = np.pad(iq_1d, ((0, window_size - len(iq_1d)), (0, 0)))
 
-        # 2. Generar espectrograma 2D mediante STFT -> (32, 9, 1)
+        # 2. Generar espectrograma 2D mediante STFT -> (32, 65, 1)
         stft_2d = spectrogram_stft(iq_1d)
 
-        # 3. Formar lotes (batch size = 1) -> (1, 128, 2) y (1, 32, 9, 1)
+        # 3. Formar lotes binarios -> (1, 1024, 2) y (1, 32, 65, 1)
         batch_1d = np.expand_dims(iq_1d, axis=0)
         batch_2d = np.expand_dims(stft_2d, axis=0)
 
-        # 4. Inferencia en Keras
+        # 4. Inferencia en el backend TensorFlow
         res = self.model.predict([batch_1d, batch_2d], verbose=0)
-        
-        # Si Keras devuelve una tupla/lista de salidas, tomamos la primera (y única)
-        if isinstance(res, (list, tuple)):
-            probs = res[0][0]
-        else:
-            probs = res[0]
+        probs = res[0][0] if isinstance(res, (list, tuple)) else res[0]
 
-        # 5. Obtener clase con mayor probabilidad
+        # 5. Mapear salida a etiqueta
         idx_max = int(np.argmax(probs))
         confidence = float(probs[idx_max])
 
-        if hasattr(self, "classes") and self.classes is not None and len(self.classes) > idx_max:
+        if self.classes is not None and len(self.classes) > idx_max:
             predicted_class = str(self.classes[idx_max])
         else:
             predicted_class = f"Clase_{idx_max}"

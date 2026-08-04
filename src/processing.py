@@ -31,18 +31,19 @@ def normalize_iq(iq_data):
 def spectrogram_stft(iq_data, fs=1.0):
     """
     Transforma los datos IQ en espectrogramas usando STFT.
-    Apropiado para arquitecturas CNN 2D. Garantiza salida de shape (17, 9, 1).
+    Apropiado para arquitecturas CNN 2D. 
+    Soporta ráfagas de 128 muestras (32, 9, 1) y 1024 muestras (32, 65, 1).
     """
     logging.info("Generando espectrograma usando STFT configurado para AMC.")
     iq_data = np.asarray(iq_data)
 
-    # 1. Combinar componentes I/Q si se recibe un tensor temporal (128, 2)
+    # 1. Combinar componentes I/Q si se recibe un tensor temporal (N, 2)
     if iq_data.ndim == 2 and iq_data.shape[1] == 2:
         iq_complex = iq_data[:, 0] + 1j * iq_data[:, 1]
     else:
         iq_complex = iq_data.astype(complex)
 
-    # 2. Configurar scipy.signal.stft para obtener dimensiones (17, 9) con ráfagas de 128 muestras
+    # 2. Configurar scipy.signal.stft para obtener ráfagas de 128 o 1024 muestras
     f, t, Zxx = signal.stft(
         iq_complex,
         fs=fs,
@@ -62,17 +63,17 @@ def spectrogram_stft(iq_data, fs=1.0):
     else:
         espectrograma = np.zeros_like(espectrograma)
 
-    # 4. Expandir dimensiones agregando el canal al final -> (17, 9, 1)
+    # 4. Expandir dimensiones agregando el canal al final -> (32, 9, 1) o (32, 65, 1)
     espectrograma_tensor = np.expand_dims(espectrograma, axis=-1)
 
-    # Validación estricta de dimensiones
-    expected_shape = (32, 9, 1)
-    if espectrograma_tensor.shape != expected_shape:
+    # 5. Validación dinámica de dimensiones (Retrocompatible)
+    expected_shapes = [(32, 9, 1), (32, 65, 1)]
+    if espectrograma_tensor.shape not in expected_shapes:
         logging.error(
-            f"Error de dimensiones en spectrogram_stft. Actual: {espectrograma_tensor.shape}, Esperado: {expected_shape}"
+            f"Error de dimensiones en spectrogram_stft. Actual: {espectrograma_tensor.shape}, Esperado: {expected_shapes}"
         )
         raise ValueError(
-            f"El espectrograma resultante de la STFT {espectrograma_tensor.shape} no coincide con el esperado {expected_shape}."
+            f"El espectrograma resultante de la STFT {espectrograma_tensor.shape} no coincide con ningún tamaño esperado."
         )
 
     return espectrograma_tensor

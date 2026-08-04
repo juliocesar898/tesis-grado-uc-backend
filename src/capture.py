@@ -22,7 +22,7 @@ class SDRWorker:
         }
         
         # Variables para cargar el dataset RadioML
-        self.dataset_path = "dataset/RML2016.10a_dict.pkl"
+        self.dataset_path = "dataset/GOLD_XYZ_OSC.0001_1024.hdf5"
         self.radio_ml_data = None
         self.radio_ml_keys = None
 
@@ -47,69 +47,65 @@ class SDRWorker:
             logging.info("[SDR WORKER] Hilo de telemetría detenido.")
 
     def load_dataset_for_simulation(self):
-        """Carga el dataset en memoria solo la primera vez que se inicia el loop"""
+        """Carga el dataset HDF5 en memoria de forma ultra rápida para simular ráfagas reales"""
         if self.radio_ml_data is None:
-            logging.info(f"[SDR WORKER] Cargando {self.dataset_path} en RAM...")
+            logging.info(f"[SDR WORKER] Cargando {self.dataset_path} para simulación en RAM...")
             try:
-                with open(self.dataset_path, 'rb') as f:
-                    self.radio_ml_data = pickle.load(f, encoding='latin1')
+                import h5py
+                with h5py.File(self.dataset_path, 'r') as f:
+                    total_muestras = f['X'].shape[0]
+                    # Queremos extraer unas 40,000 muestras representativas para simular
+                    num_sim_samples = min(40000, total_muestras)
                     
-                    # FILTRO SNR > 0: Guardamos solo las llaves que tienen SNR positivo
-                    self.radio_ml_keys = [k for k in self.radio_ml_data.keys() if k[1] > 0]
+                    # Usamos muestreo secuencial por saltos (strided slicing) - Tarda 1 segundo
+                    step = total_muestras // num_sim_samples
                     
-                logging.info(f"[SDR WORKER] ¡Dataset cargado con éxito! Usando solo señales con SNR > 0.")
+                    self.X_sim = f['X'][::step][:num_sim_samples]
+                    self.Y_sim = f['Y'][::step][:num_sim_samples]
+                    self.Z_sim = f['Z'][::step][:num_sim_samples]
+                    
+                self.clases_2018 = [
+                    'OOK', '4ASK', '8ASK', 'BPSK', 'QPSK', '8PSK', '16PSK', '32PSK',
+                    '16APSK', '32APSK', '64APSK', '128APSK', '16QAM', '32QAM', '64QAM',
+                    '128QAM', '256QAM', 'AM-SSB-WC', 'AM-SSB-SC', 'AM-DSB-WC', 'AM-DSB-SC',
+                    'FM', 'GMSK', 'OQPSK'
+                ]
+                self.radio_ml_data = True  # Flag para indicar carga exitosa
+                logging.info(f"[SDR WORKER] ¡Dataset 1024-IQ de simulación listo para tiempo real!")
             except Exception as e:
-                logging.error(f"[SDR WORKER ERROR] No se pudo cargar el dataset: {e}")
-
+                logging.error(f"[SDR WORKER ERROR] No se pudo cargar el dataset HDF5: {e}")
 
     def _loop_procesamiento(self):
-        """El bucle real que corre en el hilo secundario generando ráfagas"""
+        """El bucle real en segundo plano adaptado a muestras de longitud 1024"""
         self.load_dataset_for_simulation()
-
-        # Variables para mantener la señal unos segundos
-        current_key = None
-        last_change_time = 0
-        segundos_por_modulacion = 6.0  # Tiempo que durará cada señal antes de cambiar
 
         while self.is_running:
             try:
-                # Verificar que el dataset esté cargado
-                if self.radio_ml_data and self.radio_ml_keys:
+                if hasattr(self, 'X_sim'):
+                    # 1. Elegir ráfaga aleatoria
+                    idx = random.randint(0, len(self.X_sim) - 1)
+                    iq_sample = self.X_sim[idx]       # Forma: (1024, 2)
+                    y_one_hot = self.Y_sim[idx]       # Forma: (24,)
+                    snr_generado = self.Z_sim[idx][0]  # SNR en dB
                     
-                    # 1. Cambiar la Modulación y SNR solo si ya pasó el tiempo establecido
-                    tiempo_actual = time.time()
-                    if current_key is None or (tiempo_actual - last_change_time) > segundos_por_modulacion:
-                        current_key = random.choice(self.radio_ml_keys)
-                        last_change_time = tiempo_actual
-                        logging.info("-" * 50)
-                        logging.info(f"[SDR WORKER] Cambiando sintonía a nueva señal...")
+                    # Extraer etiqueta real
+                    class_idx = np.argmax(y_one_hot)
+                    mod_name_generada = self.clases_2018[class_idx]
                     
-                    # Limpiar el string
-                    mod_name_generada = current_key[0].decode('utf-8') if isinstance(current_key[0], bytes) else current_key[0]
-                    snr_generado = current_key[1]
+                    # 2. Generar tensor complejo IQ
+                    ventana_iq = iq_sample[:, 0] + 1j * iq_sample[:, 1]
                     
-                    # 2. Extraer una ráfaga aleatoria DENTRO de la modulación actual
-                    muestras = self.radio_ml_data[current_key]
-                    idx = random.randint(0, len(muestras) - 1)
-                    iq_sample = muestras[idx]  # Forma: (2, 128)
-                    
-                    # 3. Convertir a Array Complejo (I + jQ)
-                    ventana_iq = iq_sample[0] + 1j * iq_sample[1]
-                    
-                    # 4. Inferencia con la IA (Solo si está activa en la config)
+                    # 3. Inferencia
                     if self.config.get("run_amc_inference"):
                         predicted_class, confidence = model_dep.predict(ventana_iq)
                         
-                        # Formatear bonito para la consola
-                        logging.info(f"[IA CONSOLA] Real: {mod_name_generada:8} (SNR: {snr_generado:3}dB) | Predicho: {predicted_class:8} ({confidence*100:6.2f}%)")
-                        
-                    # (Más adelante aquí enviaremos los datos al WebSocket)
-                    
+                        logging.info(
+                            f"[IA CONSOLA] Real: {mod_name_generada:10} (SNR: {snr_generado:4.1f}dB) "
+                            f"| Predicho: {predicted_class:10} ({confidence*100:6.2f}%)"
+                        )
             except Exception as e:
                 logging.error(f"[SDR WORKER ERROR] Fallo en loop de captura: {e}")
             
-            # 5. Esperar 1.5 segundos entre cada escaneo de la misma señal
             time.sleep(1.5)
-
 # Instancia global para ser importada en el router
 sdr_worker = SDRWorker()
