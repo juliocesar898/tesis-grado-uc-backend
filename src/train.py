@@ -2,10 +2,26 @@ import os
 import sys
 import numpy as np
 import logging
+import gc  # Liberador de RAM explícito
 from pathlib import Path
+
+# -- PROTECCIÓN FÍSICA PARA CPU (EVITAR PANTALLA AZUL / BSOD) --
+# Limitar hilos a nivel de bibliotecas de álgebra lineal antes de importar TF
+os.environ["OMP_NUM_THREADS"] = "4"
+os.environ["MKL_NUM_THREADS"] = "4"
+os.environ["OPENBLAS_NUM_THREADS"] = "4"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "4"
+os.environ["NUMEXPR_NUM_THREADS"] = "4"
 
 # Asegurar que el path reconozca el módulo 'src' desde la raíz del proyecto
 sys.path.append(str(Path(__file__).resolve().parent.parent))
+
+# Importación segura de TensorFlow configurando límites de subprocesos
+import tensorflow as tf
+total_cores = os.cpu_count() or 4
+usar_cores = max(1, total_cores - 2) # Dejar siempre 2 núcleos libres para el sistema OS
+tf.config.threading.set_intra_op_parallelism_threads(usar_cores)
+tf.config.threading.set_inter_op_parallelism_threads(2)
 
 from sklearn.model_selection import train_test_split
 from tensorflow.keras.utils import to_categorical # type: ignore
@@ -72,7 +88,7 @@ def prepare_dataset(dataset_path: str, num_samples: int = 120000):
     return X_1d, X_2d, Y_raw, classes
 
 
-def run_training(dataset_path: str, epochs: int = 40, batch_size: int = 256):
+def run_training(dataset_path: str, epochs: int = 40, batch_size: int = 128):
     setup_logging()
     
     if not os.path.exists(dataset_path):
@@ -80,13 +96,20 @@ def run_training(dataset_path: str, epochs: int = 40, batch_size: int = 256):
         logging.error("Asegúrate de colocar 'GOLD_XYZ_OSC.0001_1024.hdf5' en la ruta especificada.")
         return
 
-    # 1. Preparación de datos (Cargamos de forma predeterminada 120,000 muestras para balancear precisión y consumo de RAM)
+    # 1. Preparación de datos
     X_1d, X_2d, Y, classes = prepare_dataset(dataset_path, num_samples=120000)
 
     # 2. Dividir en conjuntos de Entrenamiento y Validación (80/20)
     X1_train, X1_val, X2_train, X2_val, Y_train, Y_val = train_test_split(
         X_1d, X_2d, Y, test_size=0.2, random_state=42, stratify=np.argmax(Y, axis=1)
     )
+
+    # -- OPTIMIZACIÓN DE MEMORIA RAM --
+    # Eliminar referencias a variables pesadas que ya fueron duplicadas por `train_test_split`
+    del X_1d
+    del X_2d
+    del Y
+    gc.collect()  # Invocar inmediatamente el recolector de basura
 
     # 3. Construir Modelo con Shapes Alineados (1024, 2) y (32, 65, 1) para 24 Clases
     num_classes = len(classes)
@@ -121,7 +144,7 @@ def run_training(dataset_path: str, epochs: int = 40, batch_size: int = 256):
         y=Y_train,
         validation_data=([X1_val, X2_val], Y_val),
         epochs=epochs,
-        batch_size=batch_size,
+        batch_size=batch_size,     # Default modificado a 128 para mitigar estrés en CPU
         callbacks=callbacks,
         verbose=1
     )
@@ -142,4 +165,5 @@ def run_training(dataset_path: str, epochs: int = 40, batch_size: int = 256):
 if __name__ == "__main__":
     # Ruta predeterminada al HDF5 de RadioML 2018.01A
     DATASET_FILE = "dataset/GOLD_XYZ_OSC.0001_1024.hdf5"
-    run_training(DATASET_FILE, epochs=40, batch_size=256)
+    # Lote reducido de 256 a 128 para estabilizar la temperatura del procesador y RAM del sistema
+    run_training(DATASET_FILE, epochs=40, batch_size=128)

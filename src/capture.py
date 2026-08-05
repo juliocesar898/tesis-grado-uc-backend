@@ -19,6 +19,7 @@ class SDRWorker:
             "process_constellation": True,
             "process_psd": True,
             "run_amc_inference": True,
+            "min_snr_db": 6.0,  # <-- Filtro configurable de SNR mínimo (por defecto 6.0 dB)
         }
         
         # Variables para cargar el dataset RadioML
@@ -82,12 +83,29 @@ class SDRWorker:
         while self.is_running:
             try:
                 if hasattr(self, 'X_sim'):
-                    # 1. Elegir ráfaga aleatoria
-                    idx = random.randint(0, len(self.X_sim) - 1)
-                    iq_sample = self.X_sim[idx]       # Forma: (1024, 2)
-                    y_one_hot = self.Y_sim[idx]       # Forma: (24,)
-                    snr_generado = self.Z_sim[idx][0]  # SNR en dB
+                    # Umbral actual desde la configuración del worker
+                    min_snr_db = float(self.config.get("min_snr_db", 6.0))
                     
+                    encontrado = False
+                    intentos = 0
+                    
+                    # 1. Buscar ráfaga aleatoria que cumpla el umbral de SNR mínimo
+                    # Se incluye un límite de intentos para evitar bucles infinitos
+                    while not encontrado and self.is_running and intentos < 1000:
+                        idx = random.randint(0, len(self.X_sim) - 1)
+                        snr_generado = float(self.Z_sim[idx][0])  # SNR en dB del dataset
+                        
+                        if snr_generado >= min_snr_db:
+                            encontrado = True
+                            iq_sample = self.X_sim[idx]       # Forma: (1024, 2)
+                            y_one_hot = self.Y_sim[idx]       # Forma: (24,)
+                        intentos += 1
+                    
+                    if not encontrado:
+                        # Si no se encuentra una muestra adecuada, espera e intenta de nuevo
+                        time.sleep(1.5)
+                        continue
+
                     # Extraer etiqueta real
                     class_idx = np.argmax(y_one_hot)
                     mod_name_generada = self.clases_2018[class_idx]
@@ -107,5 +125,6 @@ class SDRWorker:
                 logging.error(f"[SDR WORKER ERROR] Fallo en loop de captura: {e}")
             
             time.sleep(1.5)
+
 # Instancia global para ser importada en el router
 sdr_worker = SDRWorker()
