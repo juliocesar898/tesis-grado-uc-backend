@@ -48,45 +48,46 @@ def setup_logging():
     )
 
 
-def prepare_dataset(dataset_path: str, num_samples: int = 120000):
+def prepare_dataset(dataset_path: str, num_samples: int = 250000):
     """
-    Carga el dataset RadioML 2018.01A (HDF5) y construye las entradas duales (1D IQ + 2D STFT).
-    Utiliza un tamaño máximo de muestras para no agotar la memoria RAM del sistema.
+    Carga el dataset RadioML 2018.01A (HDF5) y construye las entradas duales
+    sincronizadas (1D IQ + 2D STFT).
     """
     logging.info(">> Cargando el dataset RadioML 2018.01A...")
     X_raw, Y_raw, Z_raw = cargar_radio_ml_2018(dataset_path, num_samples=num_samples)
 
     num_samples_loaded = len(X_raw)
-    logging.info(f">> Procesando {num_samples_loaded} ráfagas para la arquitectura dual...")
+    logging.info(f">> Procesando {num_samples_loaded} ráfagas con Sincronización CFO...")
 
-    # 1. El array X de RadioML 2018 ya posee la forma (N, 1024, 2). No necesita transponerse.
-    X_1d = X_raw
-
-    # 2. Generar X_2D (STFT Spectrograms): (N, 32, 65, 1)
-    logging.info(">> Calculando espectrogramas STFT para la rama 2D (muestras de 1024)...")
+    # Forzar arrays de salida optimizados
+    X_1d = np.zeros_like(X_raw)
     X_2d_list = []
-    
+
+    # Importar sinc localmente
+    from src.processing import sincronizar_cfo_rf, normalize_iq
+
+    logging.info("Generando espectrograma usando STFT configurado para AMC.")
     for i in range(num_samples_loaded):
-        iq_burst = X_1d[i]
-        stft = spectrogram_stft(iq_burst)
+        # 1. Reconstruir señal compleja original de 1024 muestras
+        iq_burst_complex = X_raw[i, :, 0] + 1j * X_raw[i, :, 1]
+        
+        # 2. Sincronizar CFO para detener rotaciones
+        iq_complex_sinc = sincronizar_cfo_rf(iq_burst_complex)
+        
+        # 3. Guardar señal IQ 1D limpia y normalizada
+        X_1d[i] = normalize_iq(iq_complex_sinc, sincronizar=False)
+        
+        # 4. Generar STFT alineada con la señal ya sincronizada
+        stft = spectrogram_stft(X_1d[i], sincronizar=False)
         X_2d_list.append(stft)
 
     X_2d = np.array(X_2d_list)
 
-    # Asegurar la 4ta dimensión del canal (N, 32, 65, 1) si viene como (N, 32, 65)
     if X_2d.ndim == 3:
         X_2d = np.expand_dims(X_2d, axis=-1)
 
-    # 3. Mapeo de Etiquetas (Y_raw ya viene como codificación One-Hot de 24 clases)
     classes = CLASES_2018
-
-    logging.info(f">> Clases de modulación ({len(classes)}): {classes}")
-    logging.info(f">> Forma final X_1D: {X_1d.shape}")
-    logging.info(f">> Forma final X_2D: {X_2d.shape}")
-    logging.info(f">> Forma final Y: {Y_raw.shape}")
-
     return X_1d, X_2d, Y_raw, classes
-
 
 def run_training(dataset_path: str, epochs: int = 40, batch_size: int = 128):
     setup_logging()
@@ -97,7 +98,7 @@ def run_training(dataset_path: str, epochs: int = 40, batch_size: int = 128):
         return
 
     # 1. Preparación de datos
-    X_1d, X_2d, Y, classes = prepare_dataset(dataset_path, num_samples=120000)
+    X_1d, X_2d, Y, classes = prepare_dataset(dataset_path, num_samples=250000)
 
     # 2. Dividir en conjuntos de Entrenamiento y Validación (80/20)
     X1_train, X1_val, X2_train, X2_val, Y_train, Y_val = train_test_split(

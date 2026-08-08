@@ -3,7 +3,7 @@ import tensorflow as tf
 from typing import Optional, Dict, Any, Tuple
 import logging
 
-from src.processing import spectrogram_stft, normalize_iq
+from src.processing import spectrogram_stft, normalize_iq, sincronizar_cfo_rf
 
 logger = logging.getLogger(__name__)
 
@@ -37,18 +37,22 @@ class ModelDependency:
     def predict(self, ventana_iq: np.ndarray):
         """
         Recibe una ráfaga IQ, genera los tensores 1D y 2D compatibles con 1024 muestras
-        y ejecuta la inferencia en la red híbrida de 24 clases.
+        y ejecuta la inferencia en la red híbrida de 24 clases de manera unificada y sincronizada.
         """
         if self.model is None:
             raise ValueError("El modelo híbrido no ha sido cargado en memoria.")
 
-        # 1. Preparar entrada 1D -> (1024, 2)
+        # 1. Sincronizar y Normalizar Unificadamente (Evita cálculos redundantes)
         if np.iscomplexobj(ventana_iq):
-            iq_1d = np.column_stack((np.real(ventana_iq), np.imag(ventana_iq)))
+            # Aplicamos compensación de CFO en fase de ráfaga compleja original
+            ventana_sincronizada = sincronizar_cfo_rf(ventana_iq)
+            # Normalizamos y convertimos a tensor temporal de 2 canales usando funciones nativas
+            iq_1d = normalize_iq(ventana_sincronizada, sincronizar=False)
         else:
+            # En caso de que venga pre-empaquetado, lo tratamos como entrada final
             iq_1d = ventana_iq
 
-        # Escalabilidad de ventana a 1024 muestras
+        # Escalabilidad de ventana a 1024 muestras en eje temporal 1D
         window_size = 1024
         if len(iq_1d) > window_size:
             iq_1d = iq_1d[:window_size]
@@ -56,7 +60,8 @@ class ModelDependency:
             iq_1d = np.pad(iq_1d, ((0, window_size - len(iq_1d)), (0, 0)))
 
         # 2. Generar espectrograma 2D mediante STFT -> (32, 65, 1)
-        stft_2d = spectrogram_stft(iq_1d)
+        # Nota: Al pasarle 'iq_1d' ya sincronizado, le indicamos descativar la redundancia (sincronizar=False)
+        stft_2d = spectrogram_stft(iq_1d, sincronizar=False)
 
         # 3. Formar lotes binarios -> (1, 1024, 2) y (1, 32, 65, 1)
         batch_1d = np.expand_dims(iq_1d, axis=0)
@@ -78,7 +83,7 @@ class ModelDependency:
         return predicted_class, confidence
 
 
-# Singleton instanciado listo para inyectarse como global dependencie usando Depends()
+# Singleton instanciado listo para inyectarse como global dependency usando Depends()
 model_dep = ModelDependency()
 
 
