@@ -3,7 +3,7 @@ import tensorflow as tf
 from typing import Optional, Dict, Any, Tuple
 import logging
 
-from src.processing import spectrogram_stft, normalize_iq, sincronizar_cfo_rf
+from src.processing import spectrogram_stft, normalize_iq, sincronizar_cfo_rf, calcular_cumulantes_hoc
 
 logger = logging.getLogger(__name__)
 
@@ -35,43 +35,39 @@ class ModelDependency:
             raise
 
     def predict(self, ventana_iq: np.ndarray):
-        """
-        Recibe una ráfaga IQ, genera los tensores 1D y 2D compatibles con 1024 muestras
-        y ejecuta la inferencia en la red híbrida de 24 clases de manera unificada y sincronizada.
-        """
         if self.model is None:
             raise ValueError("El modelo híbrido no ha sido cargado en memoria.")
 
-        # 1. Sincronizar y Normalizar Unificadamente (Evita cálculos redundantes)
+        # 1. Sincronizar y Normalizar Unificadamente
         if np.iscomplexobj(ventana_iq):
-            # Aplicamos compensación de CFO en fase de ráfaga compleja original
             ventana_sincronizada = sincronizar_cfo_rf(ventana_iq)
-            # Normalizamos y convertimos a tensor temporal de 2 canales usando funciones nativas
             iq_1d = normalize_iq(ventana_sincronizada, sincronizar=False)
         else:
-            # En caso de que venga pre-empaquetado, lo tratamos como entrada final
             iq_1d = ventana_iq
 
-        # Escalabilidad de ventana a 1024 muestras en eje temporal 1D
+        # Escalar a 1024 muestras correspondientes
         window_size = 1024
         if len(iq_1d) > window_size:
             iq_1d = iq_1d[:window_size]
         elif len(iq_1d) < window_size:
             iq_1d = np.pad(iq_1d, ((0, window_size - len(iq_1d)), (0, 0)))
 
-        # 2. Generar espectrograma 2D mediante STFT -> (32, 65, 1)
-        # Nota: Al pasarle 'iq_1d' ya sincronizado, le indicamos descativar la redundancia (sincronizar=False)
+        # 2. Generar Espectrograma 2D
         stft_2d = spectrogram_stft(iq_1d, sincronizar=False)
 
-        # 3. Formar lotes binarios -> (1, 1024, 2) y (1, 32, 65, 1)
+        # 3. NUEVO: Calcular el vector estadístico (HOC) en tiempo de ejecución
+        stats_vector = calcular_cumulantes_hoc(iq_1d)
+
+        # 4. Formar lotes individuales de predicción expandiendo su primera dimensión
         batch_1d = np.expand_dims(iq_1d, axis=0)
         batch_2d = np.expand_dims(stft_2d, axis=0)
+        batch_stats = np.expand_dims(stats_vector, axis=0) # <-- Lote de stats (1, 8)
 
-        # 4. Inferencia en el backend TensorFlow
-        res = self.model.predict([batch_1d, batch_2d], verbose=0)
+        # 5. Inferencia Triple en el motor de TensorFlow
+        res = self.model.predict([batch_1d, batch_2d, batch_stats], verbose=0)
         probs = res[0][0] if isinstance(res, (list, tuple)) else res[0]
 
-        # 5. Mapear salida a etiqueta
+        # 6. Mapear salida a etiqueta de texto
         idx_max = int(np.argmax(probs))
         confidence = float(probs[idx_max])
 
@@ -81,7 +77,6 @@ class ModelDependency:
             predicted_class = f"Clase_{idx_max}"
 
         return predicted_class, confidence
-
 
 # Singleton instanciado listo para inyectarse como global dependency usando Depends()
 model_dep = ModelDependency()

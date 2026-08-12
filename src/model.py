@@ -1,6 +1,6 @@
 """
 DeepSignal - Automatic Modulation Classification (AMC) Model
-Arquitectura de CNN Híbrida para Procesamiento de Señales Digitales I/Q y Espectrogramas.
+Arquitectura de CNN Híbrida Multi-Input con Inyección de Características Estadísticas (Cumulantes).
 """
 
 import tensorflow as tf
@@ -35,20 +35,25 @@ def save_model(model, model_name="amc_model.h5"):
 
 
 def build_amc_cnn(
-    input_shape_1d=(128, 2), input_shape_2d=(32, 9, 1), num_classes=11, l2_reg=1e-4
+    input_shape_1d=(1024, 2), 
+    input_shape_2d=(32, 65, 1), 
+    input_shape_stats=(8,), 
+    num_classes=24, 
+    l2_reg=1e-4
 ):
     """
-    Construye una Red Neuronal Convolucional (CNN) Híbrida (Multi-Input) orientada a la
-    clasificación de señales base I/Q.
+    Construye una Red Neuronal Convolucional (CNN) Híbrida de entrada triple (Multi-Input) 
+    con inyección de características estadísticas de cumulantes.
 
     Args:
         input_shape_1d (tuple): Dimensiones de las muestras de entrada temporales.
         input_shape_2d (tuple): Dimensiones del espectrograma STFT de entrada.
+        input_shape_stats (tuple): Dimensiones de los cumulantes estadísticos inyectados (8 descriptores).
         num_classes (int): Cantidad de modulaciones posibles a clasificar.
         l2_reg (float): Parámetro para la regularización L2 evitando overfitting.
 
     Returns:
-        model (tf.keras.Model): Modelo Keras compilado.
+        model (tf.keras.Model): Modelo Keras compilado de triple entrada.
     """
     # =========================================================================
     # RAMA 1: Procesamiento Temporal 1D (Señal cruda IQ)
@@ -98,16 +103,25 @@ def build_amc_cnn(
         padding="same",
         activation="relu",
         kernel_regularizer=regularizers.l2(l2_reg),
-    )(x2)
+    )(input_2d)
     x2 = layers.BatchNormalization()(x2)
     x2 = layers.MaxPooling2D(pool_size=(2, 2))(x2)
 
     flat_2d = layers.Flatten()(x2)
 
     # =========================================================================
-    # FUSIÓN: Concatenación y Clasificación Final
+    # RAMA 3: Inyección de Características Estadísticas (Cumulantes HOC)
     # =========================================================================
-    merged = layers.concatenate([flat_1d, flat_2d])
+    input_stats = layers.Input(shape=input_shape_stats, name="stats_input")
+    
+    # Procesamiento denso ligero para integrar la escala matemática
+    x3 = layers.Dense(16, activation="relu", kernel_regularizer=regularizers.l2(l2_reg))(input_stats)
+    x3 = layers.BatchNormalization()(x3)
+
+    # =========================================================================
+    # FUSIÓN: Concatenación Triple y Clasificación Final
+    # =========================================================================
+    merged = layers.concatenate([flat_1d, flat_2d, x3])
 
     z = layers.Dense(
         256, activation="relu", kernel_regularizer=regularizers.l2(l2_reg)
@@ -120,9 +134,9 @@ def build_amc_cnn(
     # Salida categórica con Softmax
     output = layers.Dense(num_classes, activation="softmax", name="mod_prediction")(z)
 
-    # Construir el modelo multi-input
+    # Construir el modelo triple-input
     model = models.Model(
-        inputs=[input_1d, input_2d], outputs=output, name="DeepSignal_Hybrid_AMC"
+        inputs=[input_1d, input_2d, input_stats], outputs=output, name="DeepSignal_Hybrid_AMC"
     )
 
     # Compilar el modelo
@@ -138,13 +152,15 @@ def build_amc_cnn(
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
 
-    # Prueba de Humo y Arquitectura Base
-    print("Inicializando Arquitectura Híbrida DeepSignal AMC...")
+    # Prueba de Humo y Arquitectura Unificada de Entrada Triple
+    print("Inicializando Arquitectura de Entrada Triple DeepSignal AMC...")
 
-    # Ej: Asumiendo trama de 128 muestras y espectrograma de (17, 9, 1)
     amc_model = build_amc_cnn(
-        input_shape_1d=(128, 2), input_shape_2d=(17, 9, 1), num_classes=11
+        input_shape_1d=(1024, 2), 
+        input_shape_2d=(32, 65, 1), 
+        input_shape_stats=(8,), 
+        num_classes=24
     )
 
     amc_model.summary()
-    print("✓ Modelo configurado y listo para ser entrenado iterativamente.")
+    print("✓ Modelo de entrada triple configurado y listo para entrenamiento.")

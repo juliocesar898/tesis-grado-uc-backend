@@ -1,5 +1,9 @@
+import os
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 from fastapi import FastAPI
 from contextlib import asynccontextmanager
+from fastapi.middleware.cors import CORSMiddleware
 from src.api.dependencies import model_dep
 from src.api.routes import control, stream
 import logging
@@ -47,6 +51,15 @@ app = FastAPI(
     description="Backend AMC asíncrono para Inferencia de Modulaciones SDR",
     version="1.0.0",
     lifespan=lifespan,
+)
+
+# Permitir orígenes cruzados en fase de desarrollo
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Integración del Namespace API Routing

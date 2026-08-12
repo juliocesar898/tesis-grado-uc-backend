@@ -101,9 +101,9 @@ def normalize_iq(iq_data, sincronizar=False):
         iq_data = sincronizar_cfo_rf(iq_data)
 
     # 2. Normalización de amplitud por el valor absoluto máximo
-    max_val = np.max(np.abs(iq_data))
-    if max_val > 0:
-        iq_data = iq_data / max_val
+    rms = np.sqrt(np.mean(np.square(np.abs(iq_data))))
+    if rms > 0:
+        iq_data = iq_data / rms
 
     iq_tensor = np.column_stack((np.real(iq_data), np.imag(iq_data)))
 
@@ -170,3 +170,74 @@ def spectrogram_stft(iq_data, fs=1.0, sincronizar=False):
         )
 
     return espectrograma_tensor
+
+def calcular_cumulantes_hoc(iq_data):
+    """
+    Calcula los cumulantes y momentos estadísticos de orden superior (HOC)
+    del canal complejo I/Q de forma matemáticamente rigurosa.
+    Retorna un array de tamaño (8,) con: [Media_Abs, Var, C20, C40, C42, C60, C63, C80]
+    """
+    # 1. Asegurar formato complex de una sola dimensión
+    if iq_data.ndim == 2 and iq_data.shape[1] == 2:
+        complex_signal = iq_data[:, 0] + 1j * iq_data[:, 1]
+    else:
+        complex_signal = np.asarray(iq_data, dtype=complex)
+        
+    n = len(complex_signal)
+    if n == 0:
+        return np.zeros(8, dtype=float)
+        
+    # Remover componente de offset DC
+    sig = complex_signal - np.mean(complex_signal)
+    
+    # 2. Momentos Estadísticos Complejos Básicos Epq = E[s^p * (s*)^q]
+    e_20 = np.mean(sig**2)
+    e_21 = np.mean(np.abs(sig)**2)   # Varianza / Energía promedio
+    
+    e_40 = np.mean(sig**4)
+    e_41 = np.mean((sig**3) * np.conj(sig))
+    e_42 = np.mean(np.abs(sig)**4)
+    
+    e_60 = np.mean(sig**6)
+    e_63 = np.mean(np.abs(sig)**6)
+    
+    e_80 = np.mean(sig**8)
+    
+    # 3. Cumulantes de Orden Superior (HOC) Complejos
+    c_20 = e_20
+    c_21 = e_21  
+    
+    c_40 = e_40 - 3 * (e_20**2)
+    c_42 = e_42 - np.abs(e_20)**2 - 2 * (e_21**2)
+    
+    c_60 = e_60 - 15 * e_40 * e_20 + 30 * (e_20**3)
+    
+    # --- CORRECCIÓN DE FASE PARA C63 ---
+    # Usamos np.conj(e_20) para simular E02 y np.abs(e_20)**2 para simular |E20|^2
+    c_63 = (
+        e_63 
+        - 9 * e_41 * np.conj(e_20) 
+        - 6 * e_42 * e_21 
+        + 18 * (np.abs(e_20)**2) * e_21 
+        + 12 * (e_21**3)
+    )
+    
+    # c_80 es analíticamente correcto ya que no contiene variables conjugadas (s*)
+    c_80 = e_80 - 28 * e_60 * e_20 - 35 * (e_40**2) + 420 * e_40 * (e_20**2) - 630 * (e_20**4)
+    
+    # 4. Formar vector de entrada para Keras (Extrayendo magnitudes reales)
+    stats_vector = np.array([
+        np.mean(np.abs(sig)),             # Amplitud Promedio (L1)
+        float(np.real(c_21)),             # Energía Promedio (Real)
+        float(np.abs(c_20)),              # |C20|
+        float(np.abs(c_40)),              # |C40|
+        float(np.real(c_42)),             # C42 (Siempre real por definición simétrica)
+        float(np.abs(c_60)),              # |C60|
+        float(np.real(c_63)),             # C63 (Siempre real por definición simétrica)
+        float(np.abs(c_80))               # |C80|
+    ], dtype=float)
+    
+    # Prevenir inconsistencias numéricas
+    stats_vector = np.nan_to_num(stats_vector, nan=0.0, posinf=1.0, neginf=-1.0)
+    
+    return stats_vector
