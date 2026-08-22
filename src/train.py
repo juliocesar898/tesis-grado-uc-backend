@@ -54,13 +54,33 @@ def setup_logging():
     )
 
 
-def prepare_dataset(dataset_path: str, num_samples: int = 400000):
+def prepare_dataset(dataset_path: str, num_samples: int = 100000, min_snr_db: float = -4.0):
     """
-    Carga el dataset RadioML 2018.01A (HDF5) y construye las entradas triples
-    sincronizadas (1D IQ + 2D STFT + 1D Cumulantes HOC).
+    Carga el dataset RadioML 2018.01A (HDF5), filtra las muestras por umbral de SNR,
+    baraja los datos para una distribución homogénea en lotes, y construye las entradas
+    triples sincronizadas (1D IQ + 2D STFT + 1D Cumulantes HOC).
     """
     logging.info(">> Cargando el dataset RadioML 2018.01A...")
     X_raw, Y_raw, Z_raw = cargar_radio_ml_2018(dataset_path, num_samples=num_samples)
+
+    # --- FILTRADO DE SNR BAJA PARA EVITAR CLASIFICACIÓN DE RUIDO PURO ---
+    snrs = Z_raw[:, 0]
+    indices_validos = np.where(snrs >= min_snr_db)[0]
+    logging.info(
+        f">> Aplicando filtro de SNR mínima de {min_snr_db}dB. "
+        f"Muestras antes del filtro: {len(X_raw)} -> Muestras restantes: {len(indices_validos)}"
+    )
+    X_raw = X_raw[indices_validos]
+    Y_raw = Y_raw[indices_validos]
+    Z_raw = Z_raw[indices_validos]
+
+    # --- SHUFFLING (BARAJADO ALEATORIO) EFICIENTE ---
+    # Rompe el orden secuencial agrupado por SNR nativo del HDF5
+    logging.info(">> Barajando muestras secuenciales de forma pseudoaleatoria...")
+    np.random.seed(42)
+    shuffled_indices = np.random.permutation(len(X_raw))
+    X_raw = X_raw[shuffled_indices]
+    Y_raw = Y_raw[shuffled_indices]
 
     num_samples_loaded = len(X_raw)
     logging.info(f">> Procesando {num_samples_loaded} ráfagas con Sincronización CFO y HOC...")
@@ -99,7 +119,7 @@ def prepare_dataset(dataset_path: str, num_samples: int = 400000):
     return X_1d, X_2d, X_stats, Y_raw, classes
 
 
-def run_training(dataset_path: str, epochs: int = 40, batch_size: int = 128):
+def run_training(dataset_path: str, epochs: int = 40, batch_size: int = 128, num_samples: int = 100000):
     setup_logging()
     
     if not os.path.exists(dataset_path):
@@ -107,8 +127,8 @@ def run_training(dataset_path: str, epochs: int = 40, batch_size: int = 128):
         logging.error("Asegúrate de colocar 'GOLD_XYZ_OSC.0001_1024.hdf5' en la ruta especificada.")
         return
 
-    # 1. Preparación de datos de entrada triple
-    X_1d, X_2d, X_stats, Y, classes = prepare_dataset(dataset_path, num_samples=400000)
+    # 1. Preparación de datos de entrada triple usando el parámetro num_samples dinámico
+    X_1d, X_2d, X_stats, Y, classes = prepare_dataset(dataset_path, num_samples=num_samples, min_snr_db=-4.0)
 
     # 2. Dividir en conjuntos de Entrenamiento y Validación (80/20) estratificado
     X1_train, X1_val, X2_train, X2_val, Xs_train, Xs_val, Y_train, Y_val = train_test_split(
@@ -178,4 +198,8 @@ def run_training(dataset_path: str, epochs: int = 40, batch_size: int = 128):
 if __name__ == "__main__":
     # Ruta predeterminada al HDF5 de RadioML 2018.01A
     DATASET_FILE = "dataset/GOLD_XYZ_OSC.0001_1024.hdf5"
-    run_training(DATASET_FILE, epochs=40, batch_size=128)
+    
+    # Aquí puedes alternar libremente entre 100000 o 250000 muestras según lo requieras.
+    CANTIDAD_MUESTRAS = 100000
+    
+    run_training(DATASET_FILE, epochs=40, batch_size=128, num_samples=CANTIDAD_MUESTRAS)

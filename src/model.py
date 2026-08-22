@@ -1,6 +1,7 @@
 """
 DeepSignal - Automatic Modulation Classification (AMC) Model
-Arquitectura de CNN Híbrida Multi-Input con Inyección de Características Estadísticas (Cumulantes).
+Arquitectura de CNN Híbrida Multi-Input con Inyección de Características Estadísticas (Cumulantes)
+Optimizado con Mecanismos de Dual Global Pooling para reducción de Bias de Parámetros.
 """
 
 import tensorflow as tf
@@ -43,17 +44,8 @@ def build_amc_cnn(
 ):
     """
     Construye una Red Neuronal Convolucional (CNN) Híbrida de entrada triple (Multi-Input) 
-    con inyección de características estadísticas de cumulantes.
-
-    Args:
-        input_shape_1d (tuple): Dimensiones de las muestras de entrada temporales.
-        input_shape_2d (tuple): Dimensiones del espectrograma STFT de entrada.
-        input_shape_stats (tuple): Dimensiones de los cumulantes estadísticos inyectados (8 descriptores).
-        num_classes (int): Cantidad de modulaciones posibles a clasificar.
-        l2_reg (float): Parámetro para la regularización L2 evitando overfitting.
-
-    Returns:
-        model (tf.keras.Model): Modelo Keras compilado de triple entrada.
+    optimizada mediante reducción de dimensiones vía Global Average/Max Pooling para
+    evitar overfitting y asfixia por regularización L2.
     """
     # =========================================================================
     # RAMA 1: Procesamiento Temporal 1D (Señal cruda IQ)
@@ -80,7 +72,21 @@ def build_amc_cnn(
     x1 = layers.BatchNormalization()(x1)
     x1 = layers.MaxPooling1D(pool_size=2)(x1)
 
-    flat_1d = layers.Flatten()(x1)
+    # --- REEMPLAZO FLATTEN POR DUAL GLOBAL POOLING 1D ---
+    # Extrae el promedio de energía espacial y picos del vector temporal,
+    # logrando representaciones robustas y ultraligeras.
+    avg_pool_1d = layers.GlobalAveragePooling1D()(x1)
+    max_pool_1d = layers.GlobalMaxPooling1D()(x1)
+    concat_1d = layers.concatenate([avg_pool_1d, max_pool_1d]) # Dim: 256
+
+    proj_1d = layers.Dense(
+        128, 
+        activation="relu", 
+        kernel_regularizer=regularizers.l2(l2_reg),
+        name="proj_1d"
+    )(concat_1d)
+    proj_1d = layers.BatchNormalization()(proj_1d)
+    proj_1d = layers.Dropout(0.2)(proj_1d)
 
     # =========================================================================
     # RAMA 2: Procesamiento Frecuencial 2D (Espectrograma STFT)
@@ -103,30 +109,48 @@ def build_amc_cnn(
         padding="same",
         activation="relu",
         kernel_regularizer=regularizers.l2(l2_reg),
-    )(input_2d)
+    )(x2)
     x2 = layers.BatchNormalization()(x2)
     x2 = layers.MaxPooling2D(pool_size=(2, 2))(x2)
 
-    flat_2d = layers.Flatten()(x2)
+    # --- REEMPLAZO FLATTEN POR DUAL GLOBAL POOLING 2D ---
+    avg_pool_2d = layers.GlobalAveragePooling2D()(x2)
+    max_pool_2d = layers.GlobalMaxPooling2D()(x2)
+    concat_2d = layers.concatenate([avg_pool_2d, max_pool_2d]) # Dim: 128
+
+    proj_2d = layers.Dense(
+        128, 
+        activation="relu", 
+        kernel_regularizer=regularizers.l2(l2_reg),
+        name="proj_2d"
+    )(concat_2d)
+    proj_2d = layers.BatchNormalization()(proj_2d)
+    proj_2d = layers.Dropout(0.2)(proj_2d)
 
     # =========================================================================
     # RAMA 3: Inyección de Características Estadísticas (Cumulantes HOC)
     # =========================================================================
     input_stats = layers.Input(shape=input_shape_stats, name="stats_input")
     
-    # Procesamiento denso ligero para integrar la escala matemática
-    x3 = layers.Dense(16, activation="relu", kernel_regularizer=regularizers.l2(l2_reg))(input_stats)
+    x3 = layers.Dense(
+        32, 
+        activation="relu", 
+        kernel_regularizer=regularizers.l2(l2_reg),
+        name="proj_stats"
+    )(input_stats)
     x3 = layers.BatchNormalization()(x3)
 
     # =========================================================================
-    # FUSIÓN: Concatenación Triple y Clasificación Final
+    # FUSIÓN: Concatenación Triple Altamente Balanceada
     # =========================================================================
-    merged = layers.concatenate([flat_1d, flat_2d, x3])
+    # Fusión matemática equitativa y ligera frente a Overfitting:
+    # 128 (Temporal) + 128 (Espectral) + 32 (Cumulantes) = 288 neuronas balanceadas.
+    merged = layers.concatenate([proj_1d, proj_2d, x3], name="balanced_fusion")
 
     z = layers.Dense(
         256, activation="relu", kernel_regularizer=regularizers.l2(l2_reg)
     )(merged)
-    z = layers.Dropout(0.5)(z)
+    z = layers.Dropout(0.4)(z)
 
     z = layers.Dense(128, activation="relu")(z)
     z = layers.Dropout(0.3)(z)
@@ -152,8 +176,8 @@ def build_amc_cnn(
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
 
-    # Prueba de Humo y Arquitectura Unificada de Entrada Triple
-    print("Inicializando Arquitectura de Entrada Triple DeepSignal AMC...")
+    # Prueba de Humo de la Red
+    print("Inicializando Arquitectura de Entrada Triple DeepSignal AMC con Global Pooling...")
 
     amc_model = build_amc_cnn(
         input_shape_1d=(1024, 2), 
@@ -163,4 +187,4 @@ if __name__ == "__main__":
     )
 
     amc_model.summary()
-    print("✓ Modelo de entrada triple configurado y listo para entrenamiento.")
+    print("✓ Modelo configurado, parametrizado y listo para re-entrenamiento.")

@@ -144,7 +144,8 @@ def spectrogram_stft(iq_data, fs=1.0, sincronizar=False):
         noverlap=16,
         nfft=32,
         boundary="even",
-        padded=True
+        padded=True,
+        return_onesided=False
     )
     espectrograma = np.abs(Zxx)
 
