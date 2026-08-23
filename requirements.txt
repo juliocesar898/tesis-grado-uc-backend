@@ -95,10 +95,12 @@ prompt_toolkit==3.0.52
 protobuf==7.34.1
 psutil==7.2.2
 pure_eval==0.2.3
+pyadi-iio==0.0.21
 pycparser==3.0
 pydantic==2.13.4
 pydantic_core==2.46.4
 Pygments==2.20.0
+pylibiio==0.25
 pyparsing==3.3.2
 pyrtlsdr==0.4.0
 python-dateutil==2.9.0.post0
