@@ -7,7 +7,12 @@ import random
 
 from src.api.websocket_manager import stream_manager
 from src.api.dependencies import model_dep
-from src.processing import obtener_familia_modulacion, sincronizar_cfo_rf, recuperar_reloj_simbolo
+from src.processing import (
+    obtener_familia_modulacion,
+    sincronizar_cfo_rf,
+    recuperar_reloj_simbolo,
+    calcular_cumulantes_hoc
+)
 
 class SDRWorker:
     def __init__(self):
@@ -320,6 +325,11 @@ class SDRWorker:
                             peak_freq_hz = fc_cur + peak_offset_hz
                             peak_power_db = float(psd_sub[idx_peak])
 
+                            # Cálculo de Ancho de Banda Estimado a -10 dB del pico
+                            threshold_db = peak_power_db - 10.0
+                            bins_above = np.where(psd_sub >= threshold_db)[0]
+                            bw_est_hz = int(len(bins_above) * freq_step) if len(bins_above) > 0 else int(freq_step)
+
                             # Escala relativa normalizada para frontend entre 5 y 100
                             p_min = float(np.min(psd_sub))
                             p_max = float(np.max(psd_sub))
@@ -331,6 +341,29 @@ class SDRWorker:
                         except Exception as e_psd:
                             logging.error(f"[SDR WORKER] Error calculando PSD: {e_psd}")
                             psd_web = [0.0] * 128
+                            bw_est_hz = 0
+
+                    # --- 5.2 EXTRACCIÓN DE PARÁMETROS CIENTÍFICOS Y TELEMETRÍA SIGINT ---
+                    try:
+                        # 1. PAPR (Peak-to-Average Power Ratio en dB)
+                        pwr = np.abs(ventana_iq) ** 2
+                        mean_pwr = float(np.mean(pwr)) + 1e-12
+                        max_pwr = float(np.max(pwr))
+                        papr_db = round(float(10.0 * np.log10(max_pwr / mean_pwr)), 2)
+
+                        # 2. Cumulante de 4to Orden |C40| y de 2do Orden |C20|
+                        hoc_stats = calcular_cumulantes_hoc(ventana_iq)
+                        c20_val = round(float(hoc_stats[2]), 4)
+                        c40_val = round(float(hoc_stats[3]), 4)
+
+                        # 3. Potencia de Entrada RMS (dB relativo)
+                        rms_power_db = round(float(10.0 * np.log10(mean_pwr)), 1)
+                    except Exception as e_telem:
+                        logging.debug(f"[SDR WORKER] Error calculando telemetría: {e_telem}")
+                        papr_db = 0.0
+                        c20_val = 0.0
+                        c40_val = 0.0
+                        rms_power_db = 0.0
 
                     # Puntos de constelación NORMALIZADOS para renderizado en cuadrantes
                     i_pts = iq_norm.real[:256].tolist() if self.config.get("process_constellation", True) else []
@@ -349,13 +382,22 @@ class SDRWorker:
                             "peak_offset_hz": peak_offset_hz,
                             "peak_freq_hz": peak_freq_hz,
                             "peak_power_db": round(peak_power_db, 1),
-                            "bw_hz": int(self.config.get("pluto_sample_rate", 2000000))
+                            "bw_hz": int(self.config.get("pluto_sample_rate", 2000000)),
+                            "occupied_bw_hz": bw_est_hz
                         },
                         "classification": {
                             "modulation": predicted_class,
                             "probability": float(confidence),
                             "family": obtener_familia_modulacion(predicted_class),
                             "top_candidates": top_candidates
+                        },
+                        "telemetry": {
+                            "papr_db": papr_db,
+                            "c40": c40_val,
+                            "c20": c20_val,
+                            "freq_offset_hz": peak_offset_hz,
+                            "occupied_bw_hz": bw_est_hz,
+                            "rms_power_db": rms_power_db
                         },
                         "psd": psd_web,
                         "constellation": {
