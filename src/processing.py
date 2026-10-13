@@ -52,7 +52,8 @@ def obtener_familia_modulacion(clase_predicha: str) -> str:
 def sincronizar_cfo_rf(iq_complex, fs=1.0):
     """
     Estima y compensa el Carrier Frequency Offset (CFO) usando elevación
-    de potencia (M=4 para QPSK/QAM) y análisis espectral FFT.
+    de potencia (M=4 para QPSK/QAM) con FFT sobremuestreada (Zero-Padding 4x)
+    y alineamiento fino de fase a los ejes canónicos de la constelación.
     Evita que la rotación deforme las constelaciones en círculos concéntricos.
     """
     n = len(iq_complex)
@@ -60,29 +61,63 @@ def sincronizar_cfo_rf(iq_complex, fs=1.0):
         return iq_complex
 
     try:
-        # 1. Elevar la señal a la 4ª potencia para eliminar modulaciones simétricas de fase
-        iq_power4 = iq_complex ** 4
+        # 1. Quitar DC para no sesgar la detección espectral
+        iq_zero_dc = iq_complex - np.mean(iq_complex)
 
-        # 2. Calcular la FFT del residuo para encontrar el pico espectral de rotación
-        fft_vals = np.fft.fft(iq_power4)
-        fft_freqs = np.fft.fftfreq(n, d=1.0 / fs)
+        # 2. Elevar a la 4ª potencia con Zero-Padding 4x para resolución sub-bin fina
+        n_pad = n * 4
+        iq_power4 = iq_zero_dc ** 4
+        fft_vals = np.fft.fft(iq_power4, n_pad)
+        fft_freqs = np.fft.fftfreq(n_pad, d=1.0)
 
-        # Obtenemos el índice de la frecuencia con mayor energía (omitimos la componente DC)
-        idx_pico = np.argmax(np.abs(fft_vals)[1:]) + 1
-        frecuencia_estimada_rotada = fft_freqs[idx_pico]
+        # 3. Suprimir componentes de DC directa en la búsqueda del tono de rotación
+        fft_search = np.copy(fft_vals)
+        fft_search[:4] = 0
+        fft_search[-4:] = 0
 
-        # 3. La frecuencia real de CFO es el pico espectral obtenido dividido por M (4)
-        cfo_estimado = frecuencia_estimada_rotada / 4.0
+        idx_pico = np.argmax(np.abs(fft_search))
+        frecuencia_rotada = fft_freqs[idx_pico]
+        cfo_estimado = frecuencia_rotada / 4.0
 
         # 4. Generar el vector corrector exponencial e^(-j * 2 * pi * cfo * t)
         tiempo = np.arange(n)
         corrector_fase = np.exp(-1j * 2 * np.pi * cfo_estimado * tiempo)
+        iq_derotado = iq_zero_dc * corrector_fase
 
-        # 5. Aplicar la corrección por producto elemento a elemento
-        iq_sincronizado = iq_complex * corrector_fase
-        return iq_sincronizado
+        # 5. Alineamiento fino de fase (Fine Phase Lock a 45 grados para QPSK)
+        # El promedio de s^4 para constelaciones ortogonales simétricas tiene fase fija
+        phi_cuarto = np.angle(np.mean(iq_derotado ** 4))
+        phi_correccion = (phi_cuarto - np.pi) / 4.0
+        iq_alineado = iq_derotado * np.exp(-1j * phi_correccion)
+
+        return iq_alineado
     except Exception as e:
         logging.error(f"Fallo en algoritmo Coarse CFO: {e}. Retornando señal original.")
+        return iq_complex
+
+
+def recuperar_reloj_simbolo(iq_complex, sps=8):
+    """
+    Sincronizador de reloj de símbolo no lineal (Oerder-Meyr).
+    Extrae el tono de energía de símbolo en Fs/SPS y ajusta el retardo fraccional
+    para alinear el instante de muestreo óptimo (máxima apertura del ojo).
+    """
+    n = len(iq_complex)
+    if n < sps * 4:
+        return iq_complex
+
+    try:
+        mag_sq = np.abs(iq_complex) ** 2
+        fft_mag = np.fft.fft(mag_sq)
+        tone_bin = n // sps
+        phase_rad = np.angle(fft_mag[tone_bin])
+        tau = (-phase_rad / (2.0 * np.pi)) * sps
+        shift_samples = int(np.round(tau)) % sps
+        if shift_samples != 0:
+            return np.roll(iq_complex, -shift_samples)
+        return iq_complex
+    except Exception as e:
+        logging.debug(f"Aviso en sincronizador de reloj: {e}")
         return iq_complex
 
 

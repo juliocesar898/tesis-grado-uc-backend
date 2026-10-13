@@ -7,6 +7,7 @@ import random
 
 from src.api.websocket_manager import stream_manager
 from src.api.dependencies import model_dep
+from src.processing import obtener_familia_modulacion, sincronizar_cfo_rf, recuperar_reloj_simbolo
 
 class SDRWorker:
     def __init__(self):
@@ -19,8 +20,8 @@ class SDRWorker:
         self.config = {
             "mode": "simulation",        # Interruptor de procedencia de datos: 'simulation' o 'pluto'
             "pluto_ip": "ip:192.168.2.1", # URI IP del Pluto+ por USB RNDIS o Ethernet
-            "pluto_freq_hz": 915000000,  # Frecuencia portadora central de sintonía
-            "pluto_sample_rate": 1000000, # Tasa de muestreo (1 MSPS)
+            "pluto_freq_hz": 2480000000, # Frecuencia portadora central de sintonía (2.480 GHz - BLE CH 39)
+            "pluto_sample_rate": 2000000, # Tasa de muestreo (2 MSPS)
             "pluto_gain_db": 30.0,       # Amplitud de ganancia de entrada Rx en dB
             
             "process_constellation": True,
@@ -40,12 +41,30 @@ class SDRWorker:
         self.dataset_path = "dataset/GOLD_XYZ_OSC.0001_1024.hdf5"
         self.radio_ml_data = None
 
+        # Suavizador temporal de probabilidades (Filtro Moving Average de ráfagas)
+        from collections import deque
+        self.probs_history = deque(maxlen=5)
+
     def actualizar_configuracion(self, nueva_config: dict):
         """Actualiza las banderas de procesamiento bajo demanda y reinicia el estado de retención"""
-        self.config.update(nueva_config)
+        filtrada = {k: v for k, v in nueva_config.items() if v is not None}
+        modo_antiguo = self.config.get("mode")
+        self.config.update(filtrada)
+        
+        # Si se altera el modo o parámetros RF de Pluto, limpiar la instancia sdr_device para reinicialización limpia
+        if modo_antiguo != self.config.get("mode") or any(k in filtrada for k in ["pluto_freq_hz", "pluto_sample_rate", "pluto_gain_db"]):
+            if self.sdr_device is not None:
+                try:
+                    del self.sdr_device
+                except Exception:
+                    pass
+                self.sdr_device = None
+                
         # Al actualizar configuración desde la API, forzamos un cambio inmediato de modulación
         self.current_class_name = None
         self.current_class_counter = 0
+        if hasattr(self, 'probs_history'):
+            self.probs_history.clear()
         logging.info(f"[SDR WORKER] Configuración actualizada: {self.config}")
 
     def iniciar(self):
@@ -230,24 +249,122 @@ class SDRWorker:
                         ventana_iq = iq_sample[:, 0] + 1j * iq_sample[:, 1]
 
                 # --- 5. INFERENCIA Y CLASIFICACIÓN DE ALTA VELOCIDAD ---
-                if ventana_iq is not None and self.config.get("run_amc_inference"):
-                    predicted_class, confidence = model_dep.predict(ventana_iq)
+                if ventana_iq is not None:
+                    # 1. Eliminar offset DC analógico de los mezcladores I/Q del SDR
+                    ventana_iq = ventana_iq - np.mean(ventana_iq)
+
+                    # 2. Sincronización y Normalización para la constelación web
+                    iq_sinc = sincronizar_cfo_rf(ventana_iq)
+                    iq_sinc = recuperar_reloj_simbolo(iq_sinc, sps=8)
+                    rms_val = np.sqrt(np.mean(np.abs(iq_sinc)**2))
+                    if rms_val > 0:
+                        iq_norm = iq_sinc / rms_val
+                    else:
+                        iq_norm = iq_sinc
+
+                    predicted_class = "Sin Inferencia"
+                    confidence = 0.0
+                    top_candidates = []
                     
-                    logging.info(
-                        f"[IA - {modo_activo.upper()}] "
-                        f"Real: {mod_name_generada:11} "
-                        f"| Predicho: {predicted_class:11} ({confidence*100:6.2f}%)"
-                    )
+                    if self.config.get("run_amc_inference", True):
+                        inst_class, inst_conf, raw_probs = model_dep.predict(ventana_iq)
+                        self.probs_history.append(raw_probs)
+
+                        # Promedio temporal de las últimas N ráfagas (Filtro Moving Average)
+                        avg_probs = np.mean(self.probs_history, axis=0)
+                        best_idx = int(np.argmax(avg_probs))
+                        confidence = float(avg_probs[best_idx])
+                        
+                        if model_dep.classes is not None and len(model_dep.classes) > best_idx:
+                            predicted_class = str(model_dep.classes[best_idx])
+                        else:
+                            predicted_class = inst_class
+
+                        # Obtener top 3 clases candidatas
+                        top_indices = np.argsort(avg_probs)[::-1][:3]
+                        for tidx in top_indices:
+                            c_name = str(model_dep.classes[tidx]) if model_dep.classes is not None and len(model_dep.classes) > tidx else f"Clase_{tidx}"
+                            top_candidates.append({
+                                "modulation": c_name,
+                                "probability": round(float(avg_probs[tidx]), 3)
+                            })
+
+                        logging.info(
+                            f"[IA - {modo_activo.upper()}] "
+                            f"Inst: {inst_class:9} | Suavizado: {predicted_class:9} ({confidence*100:5.1f}%)"
+                        )
+
+                    # --- CÁLCULO DE PSD (DENSIDAD ESPECTRAL) CON MEDICIÓN DE PICO ---
+                    psd_web = []
+                    peak_offset_hz = 0
+                    peak_freq_hz = int(self.config.get("pluto_freq_hz", 2480000000))
+                    peak_power_db = 0.0
+
+                    if self.config.get("process_psd", True):
+                        try:
+                            N = len(ventana_iq)
+                            win = np.blackman(N)
+                            fft_res = np.fft.fftshift(np.fft.fft(ventana_iq * win))
+                            mag_sq = np.abs(fft_res) ** 2
+                            psd_raw = 10 * np.log10(mag_sq + 1e-12)
+                            # Submuestrear a 128 bins uniformemente
+                            step_psd = max(1, N // 128)
+                            psd_sub = psd_raw[::step_psd][:128]
+
+                            # Medir pico espectral exacto (frecuencia portadora y offset)
+                            idx_peak = int(np.argmax(psd_sub))
+                            fs_cur = float(self.config.get("pluto_sample_rate", 2000000))
+                            freq_step = fs_cur / 128.0
+                            peak_offset_hz = int((idx_peak - 64) * freq_step)
+                            fc_cur = int(self.config.get("pluto_freq_hz", 2480000000))
+                            peak_freq_hz = fc_cur + peak_offset_hz
+                            peak_power_db = float(psd_sub[idx_peak])
+
+                            # Escala relativa normalizada para frontend entre 5 y 100
+                            p_min = float(np.min(psd_sub))
+                            p_max = float(np.max(psd_sub))
+                            if p_max > p_min:
+                                psd_norm = ((psd_sub - p_min) / (p_max - p_min)) * 95.0 + 5.0
+                            else:
+                                psd_norm = np.full_like(psd_sub, 50.0)
+                            psd_web = psd_norm.tolist()
+                        except Exception as e_psd:
+                            logging.error(f"[SDR WORKER] Error calculando PSD: {e_psd}")
+                            psd_web = [0.0] * 128
+
+                    # Puntos de constelación NORMALIZADOS para renderizado en cuadrantes
+                    i_pts = iq_norm.real[:256].tolist() if self.config.get("process_constellation", True) else []
+                    q_pts = iq_norm.imag[:256].tolist() if self.config.get("process_constellation", True) else []
 
                     # --- 6. PROPAGAR PAYLOAD DSP VÍA WEBSOCKET ---
                     payload = {
                         "modulation": mod_name_generada,      
                         "predicted_class": predicted_class,   
                         "confidence": float(confidence),       
-                        "snr": float(snr_generado),                  
+                        "snr": float(snr_generado),
+                        "mode": modo_activo,
+                        "center_freq_hz": int(self.config.get("pluto_freq_hz", 2480000000)),
+                        "sample_rate": int(self.config.get("pluto_sample_rate", 2000000)),
+                        "spectrum": {
+                            "peak_offset_hz": peak_offset_hz,
+                            "peak_freq_hz": peak_freq_hz,
+                            "peak_power_db": round(peak_power_db, 1),
+                            "bw_hz": int(self.config.get("pluto_sample_rate", 2000000))
+                        },
+                        "classification": {
+                            "modulation": predicted_class,
+                            "probability": float(confidence),
+                            "family": obtener_familia_modulacion(predicted_class),
+                            "top_candidates": top_candidates
+                        },
+                        "psd": psd_web,
+                        "constellation": {
+                            "i": i_pts,
+                            "q": q_pts
+                        },
                         "data": {
-                            "i": ventana_iq.real.tolist(),
-                            "q": ventana_iq.imag.tolist()
+                            "i": i_pts,
+                            "q": q_pts
                         }
                     }
                     

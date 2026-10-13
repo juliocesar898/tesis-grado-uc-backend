@@ -3,7 +3,13 @@ import tensorflow as tf
 from typing import Optional, Dict, Any, Tuple
 import logging
 
-from src.processing import spectrogram_stft, normalize_iq, sincronizar_cfo_rf, calcular_cumulantes_hoc
+from src.processing import (
+    spectrogram_stft,
+    normalize_iq,
+    sincronizar_cfo_rf,
+    recuperar_reloj_simbolo,
+    calcular_cumulantes_hoc
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,9 +44,10 @@ class ModelDependency:
         if self.model is None:
             raise ValueError("El modelo híbrido no ha sido cargado en memoria.")
 
-        # 1. Sincronizar y Normalizar Unificadamente
+        # 1. Sincronizar Portadora (CFO) y Reloj de Símbolo (Timing Recovery)
         if np.iscomplexobj(ventana_iq):
             ventana_sincronizada = sincronizar_cfo_rf(ventana_iq)
+            ventana_sincronizada = recuperar_reloj_simbolo(ventana_sincronizada, sps=8)
             iq_1d = normalize_iq(ventana_sincronizada, sincronizar=False)
         else:
             iq_1d = ventana_iq
@@ -76,7 +83,7 @@ class ModelDependency:
         else:
             predicted_class = f"Clase_{idx_max}"
 
-        return predicted_class, confidence
+        return predicted_class, confidence, probs
 
 # Singleton instanciado listo para inyectarse como global dependency usando Depends()
 model_dep = ModelDependency()
