@@ -50,6 +50,14 @@ class SDRWorker:
         from collections import deque
         self.probs_history = deque(maxlen=5)
 
+        # Suavizado de video exponencial IIR para el analizador de espectro (PSD)
+        self.psd_smooth = None
+
+        # Retenedor temporal (Latch & Hold) de ráfagas para lectura humana estable
+        self.latched_burst = None
+        self.latched_burst_time = 0.0
+        self.BURST_HOLD_SECONDS = 1.8
+
     def actualizar_configuracion(self, nueva_config: dict):
         """Actualiza las banderas de procesamiento bajo demanda y reinicia el estado de retención"""
         filtrada = {k: v for k, v in nueva_config.items() if v is not None}
@@ -312,51 +320,74 @@ class SDRWorker:
                             fft_res = np.fft.fftshift(np.fft.fft(ventana_iq * win))
                             mag_sq = np.abs(fft_res) ** 2
                             psd_raw = 10 * np.log10(mag_sq + 1e-12)
+
                             # Submuestrear a 128 bins uniformemente
                             step_psd = max(1, N // 128)
                             psd_sub = psd_raw[::step_psd][:128]
 
-                            # Medir pico espectral exacto (frecuencia portadora y offset)
-                            idx_peak = int(np.argmax(psd_sub))
+                            # 1. Filtro de Video IIR Exponencial para estabilizar el espectrograma (Anti-titileo)
+                            if self.psd_smooth is None or len(self.psd_smooth) != len(psd_sub):
+                                self.psd_smooth = psd_sub.copy()
+                            else:
+                                alpha_v = 0.35
+                                self.psd_smooth = alpha_v * psd_sub + (1.0 - alpha_v) * self.psd_smooth
+
+                            psd_work = self.psd_smooth
+
+                            # 2. Análisis de energía y detección de ráfagas (Squelch Dinámico)
+                            p_median = float(np.median(psd_work))
+                            idx_peak = int(np.argmax(psd_work))
+                            peak_power_db = float(psd_work[idx_peak])
+                            snr_est_db = round(peak_power_db - p_median, 1)
+
+                            # Ráfaga presente si supera el piso de ruido por >= 6.5 dB (o en simulación sintética)
+                            instant_burst = bool(snr_est_db >= 6.5) or (modo_activo == "simulation")
+
                             fs_cur = float(self.config.get("pluto_sample_rate", 2000000))
                             freq_step = fs_cur / 128.0
-                            peak_offset_hz = int((idx_peak - 64) * freq_step)
                             fc_cur = int(self.config.get("pluto_freq_hz", 2480000000))
-                            peak_freq_hz = fc_cur + peak_offset_hz
-                            peak_power_db = float(psd_sub[idx_peak])
 
-                            # Cálculo de Ancho de Banda Estimado a -10 dB del pico
-                            threshold_db = peak_power_db - 10.0
-                            bins_above = np.where(psd_sub >= threshold_db)[0]
-                            bw_est_hz = int(len(bins_above) * freq_step) if len(bins_above) > 0 else int(freq_step)
-
-                            # Escala relativa normalizada para frontend entre 5 y 100
-                            p_min = float(np.min(psd_sub))
-                            p_max = float(np.max(psd_sub))
-                            if p_max > p_min:
-                                psd_norm = ((psd_sub - p_min) / (p_max - p_min)) * 95.0 + 5.0
+                            if instant_burst:
+                                peak_offset_hz = int((idx_peak - 64) * freq_step)
+                                peak_freq_hz = fc_cur + peak_offset_hz
+                                threshold_db = peak_power_db - 10.0
+                                bins_above = np.where(psd_work >= threshold_db)[0]
+                                bw_est_hz = int(len(bins_above) * freq_step) if len(bins_above) > 0 else int(freq_step)
                             else:
-                                psd_norm = np.full_like(psd_sub, 50.0)
-                            psd_web = psd_norm.tolist()
+                                peak_offset_hz = 0
+                                peak_freq_hz = fc_cur
+                                bw_est_hz = 0
+
+                            # Escala relativa normalizada para frontend con cota de piso calibrada
+                            p_min = float(np.min(psd_work))
+                            p_max = float(np.max(psd_work))
+                            dyn_range = p_max - p_min
+                            effective_span = max(30.0, dyn_range)
+                            psd_norm = ((psd_work - p_min) / effective_span) * 95.0 + 5.0
+                            psd_web = np.clip(psd_norm, 5.0, 100.0).tolist()
                         except Exception as e_psd:
                             logging.error(f"[SDR WORKER] Error calculando PSD: {e_psd}")
                             psd_web = [0.0] * 128
                             bw_est_hz = 0
+                            instant_burst = False
+                            p_median = -60.0
+                            snr_est_db = 0.0
+                            idx_peak = 64
+                            fc_cur = int(self.config.get("pluto_freq_hz", 2480000000))
+                            peak_freq_hz = fc_cur
+                            peak_offset_hz = 0
+                            peak_power_db = -60.0
 
                     # --- 5.2 EXTRACCIÓN DE PARÁMETROS CIENTÍFICOS Y TELEMETRÍA SIGINT ---
                     try:
-                        # 1. PAPR (Peak-to-Average Power Ratio en dB)
                         pwr = np.abs(ventana_iq) ** 2
                         mean_pwr = float(np.mean(pwr)) + 1e-12
                         max_pwr = float(np.max(pwr))
                         papr_db = round(float(10.0 * np.log10(max_pwr / mean_pwr)), 2)
 
-                        # 2. Cumulante de 4to Orden |C40| y de 2do Orden |C20|
                         hoc_stats = calcular_cumulantes_hoc(ventana_iq)
                         c20_val = round(float(hoc_stats[2]), 4)
                         c40_val = round(float(hoc_stats[3]), 4)
-
-                        # 3. Potencia de Entrada RMS (dB relativo)
                         rms_power_db = round(float(10.0 * np.log10(mean_pwr)), 1)
                     except Exception as e_telem:
                         logging.debug(f"[SDR WORKER] Error calculando telemetría: {e_telem}")
@@ -365,6 +396,74 @@ class SDRWorker:
                         c40_val = 0.0
                         rms_power_db = 0.0
 
+                    # --- 5.3 LATCH & HOLD: RETENCIÓN TEMPORAL DE RÁFAGA (LECTURA HUMANA ESTABLE) ---
+                    now = time.time()
+                    if instant_burst:
+                        self.latched_burst = {
+                            "papr_db": papr_db,
+                            "c40": c40_val,
+                            "c20": c20_val,
+                            "freq_offset_hz": peak_offset_hz,
+                            "occupied_bw_hz": bw_est_hz,
+                            "rms_power_db": rms_power_db,
+                            "snr_est_db": snr_est_db,
+                            "peak_freq_hz": peak_freq_hz,
+                            "peak_power_db": round(peak_power_db, 1),
+                            "peak_offset_hz": peak_offset_hz,
+                            "peak_bin": idx_peak,
+                            "predicted_class": predicted_class,
+                            "confidence": float(confidence),
+                            "family": obtener_familia_modulacion(predicted_class),
+                            "top_candidates": top_candidates
+                        }
+                        self.latched_burst_time = now
+
+                    is_holding = (now - self.latched_burst_time) < self.BURST_HOLD_SECONDS
+                    has_active_signal = instant_burst or is_holding
+
+                    if has_active_signal and self.latched_burst is not None:
+                        display_telem = {
+                            "papr_db": self.latched_burst["papr_db"],
+                            "c40": self.latched_burst["c40"],
+                            "c20": self.latched_burst["c20"],
+                            "freq_offset_hz": self.latched_burst["freq_offset_hz"],
+                            "occupied_bw_hz": self.latched_burst["occupied_bw_hz"],
+                            "rms_power_db": self.latched_burst["rms_power_db"],
+                            "snr_est_db": self.latched_burst["snr_est_db"],
+                            "burst_detected": True,
+                            "is_holding": is_holding and not instant_burst
+                        }
+                        display_spectrum = {
+                            "has_signal": True,
+                            "peak_offset_hz": self.latched_burst["peak_offset_hz"],
+                            "peak_freq_hz": self.latched_burst["peak_freq_hz"],
+                            "peak_power_db": self.latched_burst["peak_power_db"],
+                            "bw_hz": int(self.config.get("pluto_sample_rate", 2000000)),
+                            "occupied_bw_hz": self.latched_burst["occupied_bw_hz"],
+                            "peak_bin": self.latched_burst.get("peak_bin", idx_peak)
+                        }
+                    else:
+                        display_telem = {
+                            "papr_db": None,
+                            "c40": None,
+                            "c20": None,
+                            "freq_offset_hz": 0,
+                            "occupied_bw_hz": None,
+                            "rms_power_db": rms_power_db,
+                            "snr_est_db": snr_est_db,
+                            "burst_detected": False,
+                            "is_holding": False
+                        }
+                        display_spectrum = {
+                            "has_signal": False,
+                            "peak_offset_hz": 0,
+                            "peak_freq_hz": fc_cur,
+                            "peak_power_db": round(p_median, 1),
+                            "bw_hz": int(self.config.get("pluto_sample_rate", 2000000)),
+                            "occupied_bw_hz": 0,
+                            "peak_bin": 64
+                        }
+
                     # Puntos de constelación NORMALIZADOS para renderizado en cuadrantes
                     i_pts = iq_norm.real[:256].tolist() if self.config.get("process_constellation", True) else []
                     q_pts = iq_norm.imag[:256].tolist() if self.config.get("process_constellation", True) else []
@@ -372,33 +471,20 @@ class SDRWorker:
                     # --- 6. PROPAGAR PAYLOAD DSP VÍA WEBSOCKET ---
                     payload = {
                         "modulation": mod_name_generada,      
-                        "predicted_class": predicted_class,   
-                        "confidence": float(confidence),       
-                        "snr": float(snr_generado),
+                        "predicted_class": self.latched_burst["predicted_class"] if (has_active_signal and self.latched_burst) else predicted_class,   
+                        "confidence": self.latched_burst["confidence"] if (has_active_signal and self.latched_burst) else float(confidence),       
+                        "snr": self.latched_burst["snr_est_db"] if (has_active_signal and self.latched_burst) else float(snr_generado),
                         "mode": modo_activo,
                         "center_freq_hz": int(self.config.get("pluto_freq_hz", 2480000000)),
                         "sample_rate": int(self.config.get("pluto_sample_rate", 2000000)),
-                        "spectrum": {
-                            "peak_offset_hz": peak_offset_hz,
-                            "peak_freq_hz": peak_freq_hz,
-                            "peak_power_db": round(peak_power_db, 1),
-                            "bw_hz": int(self.config.get("pluto_sample_rate", 2000000)),
-                            "occupied_bw_hz": bw_est_hz
-                        },
+                        "spectrum": display_spectrum,
                         "classification": {
-                            "modulation": predicted_class,
-                            "probability": float(confidence),
-                            "family": obtener_familia_modulacion(predicted_class),
-                            "top_candidates": top_candidates
+                            "modulation": self.latched_burst["predicted_class"] if (has_active_signal and self.latched_burst) else predicted_class,
+                            "probability": self.latched_burst["confidence"] if (has_active_signal and self.latched_burst) else float(confidence),
+                            "family": self.latched_burst["family"] if (has_active_signal and self.latched_burst) else obtener_familia_modulacion(predicted_class),
+                            "top_candidates": self.latched_burst["top_candidates"] if (has_active_signal and self.latched_burst) else top_candidates
                         },
-                        "telemetry": {
-                            "papr_db": papr_db,
-                            "c40": c40_val,
-                            "c20": c20_val,
-                            "freq_offset_hz": peak_offset_hz,
-                            "occupied_bw_hz": bw_est_hz,
-                            "rms_power_db": rms_power_db
-                        },
+                        "telemetry": display_telem,
                         "psd": psd_web,
                         "constellation": {
                             "i": i_pts,
@@ -419,11 +505,11 @@ class SDRWorker:
             except Exception as e:
                 logging.error(f"[SDR WORKER ERROR] Fallo inesperado en el núcleo de captura: {e}")
             
-            # --- CORRECCIÓN 2: RETARDO DINÁMICO CONTRA OVERFLOW DE BÚFER ---
+            # --- CORRECCIÓN 2: CONTROL DE CADENCIA Y FLUIDEZ ESTABLE (~16-18 FPS) ---
             if modo_activo == "pluto":
-                # Como self.sdr_device.rx() bloquea el hilo por ~1 milisegundo (1 MSPS),
-                # dejamos un respiro mínimo de CPU para vaciar el flujo rápido y robusto.
-                time.sleep(0.01)
+                infer_on = bool(self.config.get("run_amc_inference", False))
+                # 55 ms de pausa da una cadencia de ~16 FPS: el Waterfall avanza relajado y legible (~9 seg de historia)
+                time.sleep(0.025 if infer_on else 0.055)
             else:
                 # Retardo pausado para no saturar al cliente Web / Frontend con ráfagas sintéticas
                 time.sleep(1.2)
