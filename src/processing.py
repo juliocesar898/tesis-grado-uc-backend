@@ -1,5 +1,6 @@
 import numpy as np
 import logging
+from functools import lru_cache
 from scipy import signal
 
 # --- AGRUPACIÓN DE CLASES POR FAMILIAS ---
@@ -49,43 +50,53 @@ def obtener_familia_modulacion(clase_predicha: str) -> str:
     return FAMILIAS_MODULACION.get(clase_predicha, "Desconocida / Ruido")
 
 
-def sincronizar_cfo_rf(iq_complex, fs=1.0):
+def estimar_cfo_hz(iq_complex, fs=2000000.0):
+    """Estima el desvío de portadora (CFO en Hz) usando elevación M=4 con zero-padding 4x."""
+    n = len(iq_complex)
+    if n == 0:
+        return 0.0
+    n_pad = n * 4
+    fft_vals = np.fft.fft(iq_complex ** 4, n_pad)
+    fft_freqs = np.fft.fftfreq(n_pad, d=1.0)
+    idx_pico = int(np.argmax(np.abs(fft_vals)))
+    if idx_pico <= 1 or idx_pico >= n_pad - 1:
+        return 0.0
+    return float((fft_freqs[idx_pico] / 4.0) * fs)
+
+
+def sincronizar_cfo_rf(iq_complex, fs=1.0, remove_dc=True):
     """
     Estima y compensa el Carrier Frequency Offset (CFO) usando elevación
     de potencia (M=4 para QPSK/QAM) con FFT sobremuestreada (Zero-Padding 4x)
     y alineamiento fino de fase a los ejes canónicos de la constelación.
-    Evita que la rotación deforme las constelaciones en círculos concéntricos.
+    No suprime el bin DC de la señal a potencia 4 para evitar inyectar
+    rotación falsa cuando el TX y RX comparten oscilador (CFO ≈ 0 Hz).
     """
     n = len(iq_complex)
     if n == 0:
         return iq_complex
 
     try:
-        # 1. Quitar DC para no sesgar la detección espectral
-        iq_zero_dc = iq_complex - np.mean(iq_complex)
+        # 1. Quitar DC solo si se solicita (evita sesgar ráfagas cortas aleatorias)
+        iq_work = (iq_complex - np.mean(iq_complex)) if remove_dc else iq_complex
 
         # 2. Elevar a la 4ª potencia con Zero-Padding 4x para resolución sub-bin fina
         n_pad = n * 4
-        iq_power4 = iq_zero_dc ** 4
+        iq_power4 = iq_work ** 4
         fft_vals = np.fft.fft(iq_power4, n_pad)
         fft_freqs = np.fft.fftfreq(n_pad, d=1.0)
 
-        # 3. Suprimir componentes de DC directa en la búsqueda del tono de rotación
-        fft_search = np.copy(fft_vals)
-        fft_search[:4] = 0
-        fft_search[-4:] = 0
+        # 3. Buscar el pico global incluyendo bin 0 (CFO nulo cuando TX/RX comparten reloj)
+        idx_pico = int(np.argmax(np.abs(fft_vals)))
+        if idx_pico <= 1 or idx_pico >= n_pad - 1:
+            iq_derotado = iq_work
+        else:
+            frecuencia_rotada = fft_freqs[idx_pico]
+            cfo_estimado = frecuencia_rotada / 4.0
+            tiempo = np.arange(n)
+            iq_derotado = iq_work * np.exp(-1j * 2 * np.pi * cfo_estimado * tiempo)
 
-        idx_pico = np.argmax(np.abs(fft_search))
-        frecuencia_rotada = fft_freqs[idx_pico]
-        cfo_estimado = frecuencia_rotada / 4.0
-
-        # 4. Generar el vector corrector exponencial e^(-j * 2 * pi * cfo * t)
-        tiempo = np.arange(n)
-        corrector_fase = np.exp(-1j * 2 * np.pi * cfo_estimado * tiempo)
-        iq_derotado = iq_zero_dc * corrector_fase
-
-        # 5. Alineamiento fino de fase (Fine Phase Lock a 45 grados para QPSK)
-        # El promedio de s^4 para constelaciones ortogonales simétricas tiene fase fija
+        # 4. Alineamiento fino de fase (Fine Phase Lock a 45 grados para QPSK)
         phi_cuarto = np.angle(np.mean(iq_derotado ** 4))
         phi_correccion = (phi_cuarto - np.pi) / 4.0
         iq_alineado = iq_derotado * np.exp(-1j * phi_correccion)
@@ -94,6 +105,81 @@ def sincronizar_cfo_rf(iq_complex, fs=1.0):
     except Exception as e:
         logging.error(f"Fallo en algoritmo Coarse CFO: {e}. Retornando señal original.")
         return iq_complex
+
+
+@lru_cache(maxsize=16)
+def generar_taps_rrc(sps=10, alpha=0.5, span=11):
+    """Genera coeficientes normalizados de un filtro Root-Raised-Cosine (RRC)."""
+    n_taps = span * sps
+    t = np.arange(-n_taps // 2, n_taps // 2 + 1) / float(sps)
+    h = np.zeros_like(t, dtype=float)
+    for i, ti in enumerate(t):
+        if ti == 0.0:
+            h[i] = 1.0 - alpha + 4.0 * alpha / np.pi
+        elif abs(abs(4.0 * alpha * ti) - 1.0) < 1e-6:
+            h[i] = (alpha / np.sqrt(2.0)) * (
+                (1.0 + 2.0 / np.pi) * np.sin(np.pi / (4.0 * alpha))
+                + (1.0 - 2.0 / np.pi) * np.cos(np.pi / (4.0 * alpha))
+            )
+        else:
+            num = np.sin(np.pi * ti * (1.0 - alpha)) + 4.0 * alpha * ti * np.cos(np.pi * ti * (1.0 + alpha))
+            den = np.pi * ti * (1.0 - (4.0 * alpha * ti) ** 2)
+            h[i] = num / den
+    norm = np.sqrt(np.sum(h ** 2))
+    return (h / norm) if norm > 0 else h
+
+
+def aplicar_filtro_acoplado_rrc(iq_complex, sps=10, alpha=0.5, span=11):
+    """
+    Aplica el filtro acoplado RRC en recepción (RRC_TX * RRC_RX = Coseno Alzado)
+    para eliminar la Interferencia Intersimbólica (ISI) y abrir el diagrama de ojo.
+    """
+    if len(iq_complex) < sps * 4:
+        return iq_complex
+    taps = generar_taps_rrc(sps=sps, alpha=alpha, span=span)
+    return np.convolve(iq_complex, taps, mode="same")
+
+
+def extraer_simbolos_optimos(iq_complex, sps=10, osr=4):
+    """
+    Recuperación fraccional de reloj de símbolo (interpolación sinc 4x) y
+    alineamiento fino de fase por orden de simetría (M=2 para BPSK horizontal,
+    M=4 para QPSK/16QAM, M=8 para 8PSK) sobre los centros de símbolo limpios.
+    """
+    if len(iq_complex) < sps * 6:
+        return iq_complex
+
+    # 1. Sobremuestreo fraccional (evita desdoblamiento de puntos cuando 1024 no es múltiplo de sps)
+    iq_up = signal.resample(iq_complex, len(iq_complex) * osr)
+    step = sps * osr
+    # Recortar extremos transitorios de convolución/FFT (2 símbolos por lado)
+    margin = step * 2
+    iq_mid = iq_up[margin:-margin] if len(iq_up) > margin * 3 else iq_up
+
+    mejor_fase = max(range(step), key=lambda k: float(np.mean(np.abs(iq_mid[k::step]) ** 2)))
+    iq_sym = iq_mid[mejor_fase::step]
+    if len(iq_sym) == 0:
+        return iq_complex
+
+    # 2. Alinear fase estática sobre los símbolos limpios según simetría de constelación
+    rms = np.sqrt(np.mean(np.abs(iq_sym) ** 2))
+    if rms > 0:
+        iq_u = iq_sym / rms
+        e20 = np.mean(iq_u ** 2)
+        e40 = np.mean(iq_u ** 4)
+        if np.abs(e20) > 0.55:
+            # BPSK / ASK -> alinear estrictamente horizontal en eje -I / +I (0° y 180°)
+            phi_corr = np.angle(e20) / 2.0
+        elif np.abs(e40) > 0.15:
+            # QPSK / 16QAM -> alinear a cuadrantes canónicos (±45°, ±135°)
+            phi_corr = (np.angle(e40) - np.pi) / 4.0
+        else:
+            # 8PSK -> alinear simetría octogonal M=8
+            e80 = np.mean(iq_u ** 8)
+            phi_corr = np.angle(e80) / 8.0 if np.abs(e80) > 0.05 else 0.0
+        iq_sym = iq_sym * np.exp(-1j * phi_corr)
+
+    return iq_sym
 
 
 def recuperar_reloj_simbolo(iq_complex, sps=8):

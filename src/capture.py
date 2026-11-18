@@ -10,7 +10,9 @@ from src.api.dependencies import model_dep
 from src.processing import (
     obtener_familia_modulacion,
     sincronizar_cfo_rf,
-    recuperar_reloj_simbolo,
+    aplicar_filtro_acoplado_rrc,
+    extraer_simbolos_optimos,
+    estimar_cfo_hz,
     calcular_cumulantes_hoc
 )
 
@@ -58,6 +60,9 @@ class SDRWorker:
         self.latched_burst_time = 0.0
         self.BURST_HOLD_SECONDS = 1.8
 
+        # Estimador lento EMA de offset DC analógico de hardware (evita sesgar ráfagas de 1024 muestras)
+        self.hw_dc_offset = 0j
+
     def actualizar_configuracion(self, nueva_config: dict):
         """Actualiza las banderas de procesamiento bajo demanda y reinicia el estado de retención"""
         filtrada = {k: v for k, v in nueva_config.items() if v is not None}
@@ -72,6 +77,7 @@ class SDRWorker:
                 except Exception:
                     pass
                 self.sdr_device = None
+            self.hw_dc_offset = 0j
                 
         # Al actualizar configuración desde la API, forzamos un cambio inmediato de modulación
         self.current_class_name = None
@@ -263,24 +269,44 @@ class SDRWorker:
 
                 # --- 5. INFERENCIA Y CLASIFICACIÓN DE ALTA VELOCIDAD ---
                 if ventana_iq is not None:
-                    # 1. Eliminar offset DC analógico de los mezcladores I/Q del SDR
-                    ventana_iq = ventana_iq - np.mean(ventana_iq)
+                    is_pluto = (modo_activo == "pluto")
 
-                    # 2. Sincronización y Normalización para la constelación web
-                    iq_sinc = sincronizar_cfo_rf(ventana_iq)
-                    iq_sinc = recuperar_reloj_simbolo(iq_sinc, sps=8)
-                    rms_val = np.sqrt(np.mean(np.abs(iq_sinc)**2))
-                    if rms_val > 0:
-                        iq_norm = iq_sinc / rms_val
+                    # 1. Compensación de offset DC: EMA lento en hardware SDR (evita sesgar ráfagas cortas de símbolos)
+                    if is_pluto:
+                        self.hw_dc_offset = 0.96 * self.hw_dc_offset + 0.04 * complex(np.mean(ventana_iq))
+                        ventana_iq = ventana_iq - self.hw_dc_offset
                     else:
-                        iq_norm = iq_sinc
+                        ventana_iq = ventana_iq - np.mean(ventana_iq)
+
+                    # 2. Sincronización CFO, Filtro Acoplado RRC (en SDR OTA) y Normalización
+                    fs_cur = float(self.config.get("pluto_sample_rate", 2000000))
+                    cfo_est_hz = int(round(estimar_cfo_hz(ventana_iq, fs=fs_cur))) if is_pluto else 0
+                    iq_sinc = sincronizar_cfo_rf(ventana_iq, remove_dc=not is_pluto)
+                    if is_pluto:
+                        iq_proc = aplicar_filtro_acoplado_rrc(iq_sinc, sps=10, alpha=0.5)
+                        iq_const_raw = extraer_simbolos_optimos(iq_proc, sps=10)
+                    else:
+                        iq_proc = iq_sinc
+                        iq_const_raw = iq_sinc
+
+                    rms_val = np.sqrt(np.mean(np.abs(iq_proc)**2))
+                    iq_norm = (iq_proc / rms_val) if rms_val > 0 else iq_proc
+
+                    rms_const = np.sqrt(np.mean(np.abs(iq_const_raw)**2))
+                    iq_const = (iq_const_raw / rms_const) if rms_const > 0 else iq_const_raw
 
                     predicted_class = "Sin Inferencia"
                     confidence = 0.0
                     top_candidates = []
                     
                     if self.config.get("run_amc_inference", True):
-                        inst_class, inst_conf, raw_probs = model_dep.predict(ventana_iq)
+                        inst_class, inst_conf, raw_probs = model_dep.predict(
+                            ventana_iq,
+                            apply_matched_filter=is_pluto,
+                            sps=10,
+                            alpha=0.5,
+                            remove_dc=not is_pluto
+                        )
                         self.probs_history.append(raw_probs)
 
                         # Promedio temporal de las últimas N ráfagas (Filtro Moving Average)
@@ -380,15 +406,19 @@ class SDRWorker:
 
                     # --- 5.2 EXTRACCIÓN DE PARÁMETROS CIENTÍFICOS Y TELEMETRÍA SIGINT ---
                     try:
-                        pwr = np.abs(ventana_iq) ** 2
+                        # Calculamos métricas sobre la señal normalizada (RMS=1.0) para que C40 y C20 tengan escala teórica
+                        target_sig = iq_norm if 'iq_norm' in locals() and iq_norm is not None else ventana_iq
+                        pwr = np.abs(target_sig) ** 2
                         mean_pwr = float(np.mean(pwr)) + 1e-12
                         max_pwr = float(np.max(pwr))
                         papr_db = round(float(10.0 * np.log10(max_pwr / mean_pwr)), 2)
 
-                        hoc_stats = calcular_cumulantes_hoc(ventana_iq)
+                        hoc_stats = calcular_cumulantes_hoc(target_sig)
                         c20_val = round(float(hoc_stats[2]), 4)
                         c40_val = round(float(hoc_stats[3]), 4)
-                        rms_power_db = round(float(10.0 * np.log10(mean_pwr)), 1)
+
+                        raw_pwr = float(np.mean(np.abs(ventana_iq) ** 2)) + 1e-12
+                        rms_power_db = round(float(10.0 * np.log10(raw_pwr)), 1)
                     except Exception as e_telem:
                         logging.debug(f"[SDR WORKER] Error calculando telemetría: {e_telem}")
                         papr_db = 0.0
@@ -403,7 +433,7 @@ class SDRWorker:
                             "papr_db": papr_db,
                             "c40": c40_val,
                             "c20": c20_val,
-                            "freq_offset_hz": peak_offset_hz,
+                            "freq_offset_hz": cfo_est_hz if is_pluto else peak_offset_hz,
                             "occupied_bw_hz": bw_est_hz,
                             "rms_power_db": rms_power_db,
                             "snr_est_db": snr_est_db,
@@ -464,9 +494,9 @@ class SDRWorker:
                             "peak_bin": 64
                         }
 
-                    # Puntos de constelación NORMALIZADOS para renderizado en cuadrantes
-                    i_pts = iq_norm.real[:256].tolist() if self.config.get("process_constellation", True) else []
-                    q_pts = iq_norm.imag[:256].tolist() if self.config.get("process_constellation", True) else []
+                    # Puntos de constelación NORMALIZADOS (muestreados en apertura óptima del ojo)
+                    i_pts = iq_const.real[:256].tolist() if self.config.get("process_constellation", True) else []
+                    q_pts = iq_const.imag[:256].tolist() if self.config.get("process_constellation", True) else []
 
                     # --- 6. PROPAGAR PAYLOAD DSP VÍA WEBSOCKET ---
                     payload = {

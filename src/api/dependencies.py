@@ -7,7 +7,7 @@ from src.processing import (
     spectrogram_stft,
     normalize_iq,
     sincronizar_cfo_rf,
-    recuperar_reloj_simbolo,
+    aplicar_filtro_acoplado_rrc,
     calcular_cumulantes_hoc
 )
 
@@ -40,14 +40,24 @@ class ModelDependency:
             logger.error(f"Error cargando dependencias de inferencia H5: {e}")
             raise
 
-    def predict(self, ventana_iq: np.ndarray):
+    def predict(
+        self,
+        ventana_iq: np.ndarray,
+        apply_matched_filter: bool = False,
+        sps: int = 10,
+        alpha: float = 0.5,
+        remove_dc: bool = True
+    ):
         if self.model is None:
             raise ValueError("El modelo híbrido no ha sido cargado en memoria.")
 
-        # 1. Sincronizar Portadora (CFO) y Reloj de Símbolo (Timing Recovery)
+        # 1. Sincronizar Portadora (CFO) y aplicar filtro acoplado RRC si es captura SDR OTA
         if np.iscomplexobj(ventana_iq):
-            ventana_sincronizada = sincronizar_cfo_rf(ventana_iq)
-            ventana_sincronizada = recuperar_reloj_simbolo(ventana_sincronizada, sps=8)
+            ventana_sincronizada = sincronizar_cfo_rf(ventana_iq, remove_dc=remove_dc)
+            if apply_matched_filter:
+                ventana_sincronizada = aplicar_filtro_acoplado_rrc(
+                    ventana_sincronizada, sps=sps, alpha=alpha
+                )
             iq_1d = normalize_iq(ventana_sincronizada, sincronizar=False)
         else:
             iq_1d = ventana_iq
